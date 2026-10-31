@@ -2,9 +2,7 @@
 import os
 import re
 import glob
-import json
 import time
-import uuid
 import shutil
 import logging
 import tempfile
@@ -21,12 +19,10 @@ log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# Адрес нашего Cloudflare Worker
 CALLBACK_URL = (
     "https://stream-finder-bot.stfualmceo.workers.dev/processor-result"
 )
 
-KICK_API = "https://kick.com/api/v1/video"
 GROQ_API = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 WHISPER_MODEL = "whisper-large-v3-turbo"
@@ -38,7 +34,6 @@ def format_time(seconds):
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
-
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
@@ -55,25 +50,33 @@ def extract_video_id(url):
 
 
 def get_kick_video_url(video_id):
-    """
-    Получает HLS-ссылку на запись Kick.
-    Новый endpoint: /api/v1/video/{uuid}
-    """
-
-    api_url = f"{KICK_API}/{video_id}"
+    api_url = (
+        f"https://web.kick.com/api/v1/stream/"
+        f"{video_id}/playback"
+    )
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0",
+        "Content-Type": "application/json",
         "Accept": "application/json",
+        "Origin": "https://kick.com",
         "Referer": "https://kick.com/"
     }
 
-    response = requests.get(
+    payload = {
+        "video_player": {
+            "player": {}
+        },
+        "video_session": {},
+        "user_session": {
+            "non_personalised_ads": True
+        }
+    }
+
+    response = requests.post(
         api_url,
         headers=headers,
+        json=payload,
         timeout=40
     )
 
@@ -81,35 +84,18 @@ def get_kick_video_url(video_id):
 
     data = response.json()
 
-    # Ищем HLS-ссылку в ответе Kick.
-    def find_m3u8(value):
-        if isinstance(value, str):
-            if ".m3u8" in value:
-                return value
+    playback = data.get("playback_url") or {}
 
-        elif isinstance(value, dict):
-            for item in value.values():
-                result = find_m3u8(item)
-                if result:
-                    return result
-
-        elif isinstance(value, list):
-            for item in value:
-                result = find_m3u8(item)
-                if result:
-                    return result
-
-        return None
-
-    playlist_url = find_m3u8(data)
+    playlist_url = (
+        playback.get("vod")
+        or playback.get("dvr")
+    )
 
     if not playlist_url:
         raise Exception(
-            "Kick не вернул ссылку на видео. "
-            "Возможно, запись удалена, приватная или недоступна."
+            "Kick не вернул ссылку на VOD. "
+            f"Ответ: {str(data)[:1000]}"
         )
-
-    log.info("Kick VOD source successfully received")
 
     return playlist_url
 
@@ -124,17 +110,14 @@ def run_ffmpeg(command, timeout=10800):
     )
 
     if result.returncode != 0:
-        error = result.stderr[-3000:] if result.stderr else "Unknown ffmpeg error"
-        raise Exception(f"FFmpeg error: {error}")
+        raise Exception(
+            "FFmpeg error: " + result.stderr[-3000:]
+        )
 
     return result
 
 
 def download_audio(playlist_url, output_file):
-    """
-    Скачивает аудио всей записи и преобразует его в MP3.
-    """
-
     command = [
         "ffmpeg",
         "-y",
@@ -143,10 +126,8 @@ def download_audio(playlist_url, output_file):
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "10",
-        "-user_agent",
-        "Mozilla/5.0",
-        "-referer",
-        "https://kick.com/",
+        "-user_agent", "Mozilla/5.0",
+        "-referer", "https://kick.com/",
         "-i", playlist_url,
         "-map", "0:a:0",
         "-vn",
@@ -157,28 +138,23 @@ def download_audio(playlist_url, output_file):
         output_file
     ]
 
-    log.info("Starting full audio download")
-
+    log.info("Downloading full audio")
     run_ffmpeg(command)
 
     if not os.path.exists(output_file):
-        raise Exception("Аудиофайл не был создан.")
+        raise Exception("Аудиофайл не создан.")
 
     if os.path.getsize(output_file) == 0:
-        raise Exception("Скачанный аудиофайл пустой.")
+        raise Exception("Аудиофайл пустой.")
 
-    log.info(
-        "Audio downloaded: %s bytes",
-        os.path.getsize(output_file)
-    )
+    log.info("Audio download completed")
 
 
 def split_audio(audio_file, output_dir):
-    """
-    Делит полную аудиозапись на части по 10 минут.
-    """
-
-    pattern = os.path.join(output_dir, "chunk_%04d.mp3")
+    pattern = os.path.join(
+        output_dir,
+        "chunk_%04d.mp3"
+    )
 
     command = [
         "ffmpeg",
@@ -198,24 +174,20 @@ def split_audio(audio_file, output_dir):
     run_ffmpeg(command)
 
     chunks = sorted(
-        glob.glob(os.path.join(output_dir, "chunk_*.mp3"))
+        glob.glob(
+            os.path.join(output_dir, "chunk_*.mp3")
+        )
     )
 
     if not chunks:
-        raise Exception("Не удалось разделить аудио на части.")
-
-    log.info("Audio divided into %s chunks", len(chunks))
+        raise Exception("Не удалось разделить аудио.")
 
     return chunks
 
 
 def transcribe_chunk(chunk_file, offset):
-    """
-    Отправляет одну часть аудио в Groq Whisper.
-    """
-
     if not GROQ_API_KEY:
-        raise Exception("На Render отсутствует GROQ_API_KEY.")
+        raise Exception("GROQ_API_KEY не настроен на Render.")
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}"
@@ -255,22 +227,19 @@ def transcribe_chunk(chunk_file, offset):
 
             segments = []
 
-            for segment in result.get("segments", []):
-                start = float(segment.get("start", 0)) + offset
-                end = float(segment.get("end", start - offset)) + offset
-                text = segment.get("text", "").strip()
+            for item in result.get("segments", []):
+                start = float(item.get("start", 0)) + offset
+                end = float(item.get("end", 0)) + offset
+                text = item.get("text", "").strip()
 
-                if not text:
-                    continue
+                if text:
+                    segments.append({
+                        "start": start,
+                        "end": end,
+                        "time": format_time(start),
+                        "text": text
+                    })
 
-                segments.append({
-                    "start": start,
-                    "end": end,
-                    "time": format_time(start),
-                    "text": text
-                })
-
-            # Если Whisper вернул только общий текст.
             if not segments and result.get("text"):
                 text = result["text"].strip()
 
@@ -282,34 +251,21 @@ def transcribe_chunk(chunk_file, offset):
                         "text": text
                     })
 
-            log.info(
-                "Chunk transcribed: %s segments",
-                len(segments)
-            )
-
             return segments
 
         except Exception as error:
             last_error = error
-
-            log.exception(
-                "Transcription attempt %s failed",
-                attempt + 1
-            )
+            log.exception("Whisper attempt failed")
 
             if attempt < 2:
                 time.sleep(5 * (attempt + 1))
 
     raise Exception(
-        f"Не удалось расшифровать аудиочасть: {last_error}"
+        f"Ошибка расшифровки: {last_error}"
     )
 
 
 def send_callback(payload):
-    """
-    Отправляет результат обратно в Cloudflare Worker.
-    """
-
     response = requests.post(
         CALLBACK_URL,
         json=payload,
@@ -320,43 +276,59 @@ def send_callback(payload):
     )
 
     response.raise_for_status()
-
-    log.info("Callback successfully delivered")
+    log.info("Callback delivered")
 
 
 def process_job(url, chat_id, job_id):
-    """
-    Полный цикл обработки одной записи Kick.
-    """
-
-    temp_dir = tempfile.mkdtemp(prefix="stream_finder_")
+    temp_dir = tempfile.mkdtemp(
+        prefix="stream_finder_"
+    )
 
     try:
         log.info("Started job %s", job_id)
 
         video_id = extract_video_id(url)
 
+        # Получаем ссылку на запись Kick.
         playlist_url = get_kick_video_url(video_id)
 
-        audio_file = os.path.join(temp_dir, "full_audio.mp3")
+        # Скачиваем аудио.
+        audio_file = os.path.join(
+            temp_dir,
+            "full_audio.mp3"
+        )
 
-        # 1. Скачиваем всю аудиозапись.
-        download_audio(playlist_url, audio_file)
+        download_audio(
+            playlist_url,
+            audio_file
+        )
 
-        # 2. Делим её на части.
-        chunks_dir = os.path.join(temp_dir, "chunks")
-        os.makedirs(chunks_dir, exist_ok=True)
+        # Делим аудио на части.
+        chunks_dir = os.path.join(
+            temp_dir,
+            "chunks"
+        )
 
-        chunks = split_audio(audio_file, chunks_dir)
+        os.makedirs(
+            chunks_dir,
+            exist_ok=True
+        )
 
-        # 3. Расшифровываем каждую часть.
+        chunks = split_audio(
+            audio_file,
+            chunks_dir
+        )
+
+        log.info("Total chunks: %s", len(chunks))
+
         all_segments = []
 
+        # Расшифровываем все части.
         for index, chunk in enumerate(chunks):
             offset = index * CHUNK_SECONDS
 
             log.info(
-                "Processing chunk %s/%s",
+                "Transcribing chunk %s/%s",
                 index + 1,
                 len(chunks)
             )
@@ -377,25 +349,22 @@ def process_job(url, chat_id, job_id):
             for item in all_segments
         )
 
-        # 4. Отправляем результат в Cloudflare.
-        callback_data = {
+        # Отправляем результат в Cloudflare.
+        send_callback({
             "job_id": job_id,
             "chat_id": str(chat_id),
             "status": "completed",
             "segments": all_segments,
             "transcript": transcript
-        }
-
-        send_callback(callback_data)
+        })
 
         log.info(
-            "Job %s completed. Total segments: %s",
-            job_id,
+            "Job completed: %s segments",
             len(all_segments)
         )
 
     except Exception as error:
-        log.exception("Job %s failed", job_id)
+        log.exception("Processing failed")
 
         try:
             send_callback({
@@ -406,7 +375,7 @@ def process_job(url, chat_id, job_id):
             })
 
         except Exception:
-            log.exception("Could not send error callback")
+            log.exception("Error callback failed")
 
     finally:
         shutil.rmtree(
@@ -451,8 +420,7 @@ def process():
 
     return jsonify({
         "status": "processing",
-        "job_id": job_id,
-        "message": "Video processing started"
+        "job_id": job_id
     }), 202
 
 
