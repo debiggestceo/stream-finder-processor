@@ -2,13 +2,15 @@
 import os
 import re
 import time
+import shutil
 import logging
 import tempfile
 import threading
 import subprocess
-import requests
 
-from urllib.parse import urljoin
+import requests
+import yt_dlp
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -18,18 +20,16 @@ log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
-
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
-KICK_API = "https://web.kick.com/api/v1/stream/{}/playback"
 
 CHUNK_SECONDS = 600
 
 active_chunks = set()
 active_lock = threading.Lock()
 
-# Кэш данных VOD между последовательными фрагментами.
-video_cache = {}
-cache_lock = threading.Lock()
+# Кэш целиком скачанных видео. Ключ — job_id.
+jobs = {}
+jobs_lock = threading.Lock()
 
 
 def format_time(seconds):
@@ -40,174 +40,151 @@ def format_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def request_with_retries(method, url, **kwargs):
-    last_error = None
+def validate_video_url(url):
+    if not isinstance(url, str):
+        raise ValueError("Ссылка должна быть текстом")
 
-    for attempt in range(3):
-        try:
-            response = requests.request(
-                method,
-                url,
-                **kwargs
-            )
-            response.raise_for_status()
-            return response
+    url = url.strip()
 
-        except requests.RequestException as error:
-            last_error = error
-            log.warning(
-                "Request failed, attempt %s/3: %s",
-                attempt + 1,
-                error
-            )
+    if not url.startswith(("https://", "http://")):
+        raise ValueError("Нужна ссылка, начинающаяся с https://")
 
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))
+    host = re.sub(r"^www\.", "", url.split("/")[2].lower())
 
-    raise last_error
-
-
-def get_video_id(url):
-    patterns = [
-        r"kick\.com/video/([a-fA-F0-9-]+)",
-        r"kick\.com/[^/]+/videos/([a-fA-F0-9-]+)"
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-
-    raise ValueError("Не удалось определить ID Kick VOD")
-
-
-def get_playback_url(video_url):
-    video_id = get_video_id(video_url)
-
-    response = request_with_retries(
-        "POST",
-        KICK_API.format(video_id),
-        json={
-            "video_player": {"player": {}},
-            "video_session": {},
-            "user_session": {"non_personalised_ads": True}
-        },
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Content-Type": "application/json"
-        },
-        timeout=30
+    allowed = (
+        host == "kick.com"
+        or host.endswith(".kick.com")
+        or host == "twitch.tv"
+        or host.endswith(".twitch.tv")
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtu.be"
     )
 
-    data = response.json()
-    playback = data.get("playback_url", {})
+    if not allowed:
+        raise ValueError("Поддерживаются только Kick, Twitch и YouTube")
 
-    playlist = playback.get("vod") or playback.get("dvr")
-
-    if not playlist:
-        raise RuntimeError("Kick не вернул ссылку на VOD")
-
-    return playlist
+    return url
 
 
-def resolve_media_playlist(url):
-    response = request_with_retries(
-        "GET",
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30
-    )
+def detect_platform(url):
+    host = url.split("/")[2].lower()
 
-    content = response.text
+    if "kick.com" in host:
+        return "Kick"
 
-    if "#EXT-X-STREAM-INF" not in content:
-        return url
+    if "twitch.tv" in host:
+        return "Twitch"
 
-    lines = content.splitlines()
-    variants = []
-
-    for i, line in enumerate(lines):
-        if line.startswith("#EXT-X-STREAM-INF"):
-            match = re.search(r"BANDWIDTH=(\d+)", line)
-            bandwidth = int(match.group(1)) if match else 0
-
-            for next_line in lines[i + 1:]:
-                next_line = next_line.strip()
-
-                if next_line and not next_line.startswith("#"):
-                    variants.append(
-                        (bandwidth, urljoin(url, next_line))
-                    )
-                    break
-
-    if not variants:
-        raise RuntimeError("Не удалось найти вариант видеопотока")
-
-    variants.sort(key=lambda item: item[0], reverse=True)
-    return variants[0][1]
+    return "YouTube"
 
 
-def get_video_duration(playlist_url):
-    media_url = resolve_media_playlist(playlist_url)
+def download_full_audio(job_id, video_url):
+    folder = tempfile.mkdtemp(prefix=f"stream_{job_id}_")
 
-    response = request_with_retries(
-        "GET",
-        media_url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30
-    )
-
-    content = response.text
-
-    if "#EXTM3U" not in content:
-        raise RuntimeError("Получен некорректный HLS playlist")
-
-    durations = re.findall(
-        r"#EXTINF:([0-9]+(?:\.[0-9]+)?)",
-        content
-    )
-
-    if not durations:
-        raise RuntimeError("Не удалось определить длительность VOD")
-
-    if "#EXT-X-ENDLIST" not in content:
-        raise RuntimeError(
-            "Kick вернул незавершённый playlist. "
-            "Обработка остановлена."
-        )
-
-    duration = sum(float(value) for value in durations)
-
-    log.info("VOD duration: %.2f seconds", duration)
-
-    return media_url, duration
-
-
-def get_video_info(video_url):
-    with cache_lock:
-        cached = video_cache.get(video_url)
-
-    if cached:
-        log.info("Using cached VOD information")
-        return cached
-
-    log.info("Getting VOD information from Kick")
-
-    playlist_url = get_playback_url(video_url)
-    media_url, duration = get_video_duration(playlist_url)
-
-    result = {
-        "media_url": media_url,
-        "duration": duration
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 40,
+        "retries": 10,
+        "fragment_retries": 10,
+        "file_access_retries": 3,
+        "concurrent_fragment_downloads": 4,
+        "continuedl": True,
+        "nopart": True,
+        "overwrites": False,
     }
 
-    with cache_lock:
-        video_cache[video_url] = result
+    try:
+        log.info("Downloading full %s video", detect_platform(video_url))
 
-    return result
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+
+            if not info:
+                raise RuntimeError("Не удалось получить информацию о видео")
+
+            if info.get("_type") == "playlist":
+                raise RuntimeError("Отправь ссылку на отдельное видео, не плейлист")
+
+            duration = info.get("duration")
+
+            if not duration or float(duration) <= 0:
+                raise RuntimeError("Не удалось определить длительность видео")
+
+            filepath = None
+
+            requested = info.get("requested_downloads") or []
+            if requested:
+                filepath = requested[0].get("filepath")
+
+            if not filepath:
+                filepath = info.get("_filename")
+
+            if not filepath:
+                filepath = ydl.prepare_filename(info)
+
+            if not os.path.isfile(filepath):
+                candidates = [
+                    os.path.join(folder, name)
+                    for name in os.listdir(folder)
+                    if os.path.isfile(os.path.join(folder, name))
+                ]
+
+                if candidates:
+                    filepath = max(candidates, key=os.path.getsize)
+
+            if not filepath or not os.path.isfile(filepath):
+                raise RuntimeError("Загруженный аудиофайл не найден")
+
+            if os.path.getsize(filepath) < 1000:
+                raise RuntimeError("Загруженный файл пустой или повреждён")
+
+            log.info(
+                "Full download completed: duration=%.2f file_size=%s",
+                float(duration),
+                os.path.getsize(filepath)
+            )
+
+            return {
+                "folder": folder,
+                "filepath": filepath,
+                "duration": float(duration),
+                "platform": detect_platform(video_url),
+                "title": info.get("title", "Видео")
+            }
+
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
 
 
-def download_audio_chunk(playlist_url, offset, duration):
+def get_job_video(job_id, video_url):
+    with jobs_lock:
+        cached = jobs.get(job_id)
+
+    if cached:
+        return cached
+
+    video = download_full_audio(job_id, video_url)
+
+    with jobs_lock:
+        # Защита от повторного создания кэша при одновременном запросе.
+        existing = jobs.get(job_id)
+
+        if existing:
+            shutil.rmtree(video["folder"], ignore_errors=True)
+            return existing
+
+        jobs[job_id] = video
+
+    return video
+
+
+def extract_audio_chunk(source_path, offset, duration):
     temp = tempfile.NamedTemporaryFile(
         suffix=".mp3",
         delete=False
@@ -218,14 +195,17 @@ def download_audio_chunk(playlist_url, offset, duration):
 
     command = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
         "-y",
         "-ss", str(offset),
-        "-i", playlist_url,
+        "-i", source_path,
         "-t", str(duration),
         "-vn",
         "-ac", "1",
         "-ar", "16000",
         "-b:a", "48k",
+        "-f", "mp3",
         output_path
     ]
 
@@ -233,18 +213,19 @@ def download_audio_chunk(playlist_url, offset, duration):
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=900
+        timeout=300
     )
 
     if result.returncode != 0:
         error = result.stderr.decode(errors="ignore")[-2000:]
-        raise RuntimeError("FFmpeg error: " + error)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise RuntimeError("Ошибка нарезки аудио: " + error)
 
-    if (
-        not os.path.exists(output_path)
-        or os.path.getsize(output_path) < 1000
-    ):
-        raise RuntimeError("Не удалось скачать аудио")
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1000:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise RuntimeError("Не удалось создать аудиофрагмент")
 
     return output_path
 
@@ -253,13 +234,13 @@ def transcribe_chunk(audio_path, offset):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY не настроен")
 
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     for attempt in range(3):
         try:
             with open(audio_path, "rb") as audio:
                 response = requests.post(
-                    url,
+                    endpoint,
                     headers={
                         "Authorization": f"Bearer {GROQ_API_KEY}"
                     },
@@ -302,6 +283,9 @@ def transcribe_chunk(audio_path, offset):
 
 
 def send_callback(payload):
+    if not PROCESSOR_SECRET:
+        raise RuntimeError("PROCESSOR_SECRET не настроен")
+
     response = requests.post(
         WORKER_URL + "/processor-chunk",
         json=payload,
@@ -313,7 +297,7 @@ def send_callback(payload):
     )
 
     response.raise_for_status()
-    log.info("Callback delivered")
+    log.info("Callback delivered: status=%s", payload.get("status"))
 
 
 def send_error(job_id, chat_id, chunk_index, error):
@@ -329,6 +313,15 @@ def send_error(job_id, chat_id, chunk_index, error):
         log.exception("Could not deliver error callback")
 
 
+def cleanup_job(job_id):
+    with jobs_lock:
+        video = jobs.pop(job_id, None)
+
+    if video:
+        shutil.rmtree(video["folder"], ignore_errors=True)
+        log.info("Temporary files removed: job=%s", job_id)
+
+
 def process_chunk_job(job_id, chat_id, video_url, chunk_index):
     key = f"{job_id}:{chunk_index}"
 
@@ -336,28 +329,23 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
         offset = chunk_index * CHUNK_SECONDS
 
         log.info(
-            "Starting job=%s chunk=%s offset=%s",
+            "Starting job=%s platform=%s chunk=%s offset=%s",
             job_id,
+            detect_platform(video_url),
             chunk_index,
             offset
         )
 
-        # Получаем информацию о видео один раз и используем кэш.
-        video = get_video_info(video_url)
+        video = get_job_video(job_id, video_url)
+        duration = video["duration"]
 
-        media_url = video["media_url"]
-        total_duration = video["duration"]
-
-        # Проверяем конец ДО скачивания аудио.
-        if offset >= total_duration:
+        # Видео закончилось: никаких новых скачиваний.
+        if offset >= duration:
             log.info(
-                "End of VOD reached: offset=%s duration=%s",
-                offset,
-                total_duration
+                "End of video: duration=%.2f offset=%s",
+                duration,
+                offset
             )
-
-            with cache_lock:
-                video_cache.pop(video_url, None)
 
             send_callback({
                 "job_id": job_id,
@@ -366,19 +354,20 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
                 "status": "completed",
                 "segments": []
             })
+
+            cleanup_job(job_id)
             return
 
-        remaining = total_duration - offset
-        chunk_duration = min(CHUNK_SECONDS, remaining)
+        chunk_duration = min(CHUNK_SECONDS, duration - offset)
 
         log.info(
-            "Downloading chunk=%s duration=%.2f",
+            "Extracting audio: chunk=%s duration=%.2f",
             chunk_index,
             chunk_duration
         )
 
-        audio_path = download_audio_chunk(
-            media_url,
+        audio_path = extract_audio_chunk(
+            video["filepath"],
             offset,
             chunk_duration
         )
@@ -418,16 +407,15 @@ def health():
     return jsonify({
         "status": "Stream Finder Processor is online",
         "groq_configured": bool(GROQ_API_KEY),
-        "processor_secret_configured": bool(PROCESSOR_SECRET)
+        "processor_secret_configured": bool(PROCESSOR_SECRET),
+        "platforms": ["Kick", "Twitch", "YouTube"]
     })
 
 
 @app.route("/process-chunk", methods=["POST"])
 def process_chunk():
     if not PROCESSOR_SECRET:
-        return jsonify({
-            "error": "Processor secret is not configured"
-        }), 500
+        return jsonify({"error": "Processor secret is not configured"}), 500
 
     if request.headers.get("X-Processor-Secret") != PROCESSOR_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
@@ -446,8 +434,11 @@ def process_chunk():
         chunk_index = int(chunk_index)
         if chunk_index < 0:
             raise ValueError()
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid chunk_index"}), 400
+
+        video_url = validate_video_url(video_url)
+
+    except (TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
 
     key = f"{job_id}:{chunk_index}"
 
