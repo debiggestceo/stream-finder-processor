@@ -8,6 +8,7 @@ import threading
 import subprocess
 import requests
 
+from urllib.parse import urljoin
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -17,12 +18,18 @@ log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
+
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 KICK_API = "https://web.kick.com/api/v1/stream/{}/playback"
 
 CHUNK_SECONDS = 600
+
 active_chunks = set()
 active_lock = threading.Lock()
+
+# Кэш данных VOD между последовательными фрагментами.
+video_cache = {}
+cache_lock = threading.Lock()
 
 
 def format_time(seconds):
@@ -33,25 +40,52 @@ def format_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def request_with_retries(method, url, **kwargs):
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = requests.request(
+                method,
+                url,
+                **kwargs
+            )
+            response.raise_for_status()
+            return response
+
+        except requests.RequestException as error:
+            last_error = error
+            log.warning(
+                "Request failed, attempt %s/3: %s",
+                attempt + 1,
+                error
+            )
+
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+
+    raise last_error
+
+
 def get_video_id(url):
-    match = re.search(
+    patterns = [
         r"kick\.com/video/([a-fA-F0-9-]+)",
-        url
-    )
-    if not match:
-        match = re.search(
-            r"kick\.com/[^/]+/videos/([a-fA-F0-9-]+)",
-            url
-        )
-    if not match:
-        raise ValueError("Не удалось определить ID Kick VOD")
-    return match.group(1)
+        r"kick\.com/[^/]+/videos/([a-fA-F0-9-]+)"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+
+    raise ValueError("Не удалось определить ID Kick VOD")
 
 
 def get_playback_url(video_url):
     video_id = get_video_id(video_url)
 
-    response = requests.post(
+    response = request_with_retries(
+        "POST",
         KICK_API.format(video_id),
         json={
             "video_player": {"player": {}},
@@ -64,7 +98,6 @@ def get_playback_url(video_url):
         },
         timeout=30
     )
-    response.raise_for_status()
 
     data = response.json()
     playback = data.get("playback_url", {})
@@ -72,55 +105,57 @@ def get_playback_url(video_url):
     playlist = playback.get("vod") or playback.get("dvr")
 
     if not playlist:
-        raise RuntimeError("Kick не вернул ссылку на видео")
+        raise RuntimeError("Kick не вернул ссылку на VOD")
 
     return playlist
 
 
 def resolve_media_playlist(url):
-    response = requests.get(
+    response = request_with_retries(
+        "GET",
         url,
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=30
     )
-    response.raise_for_status()
 
     content = response.text
 
-    # Если это master playlist, выбираем вариант с максимальной пропускной способностью.
-    if "#EXT-X-STREAM-INF" in content:
-        lines = content.splitlines()
-        variants = []
+    if "#EXT-X-STREAM-INF" not in content:
+        return url
 
-        for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF"):
-                bandwidth_match = re.search(r"BANDWIDTH=(\d+)", line)
-                bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
+    lines = content.splitlines()
+    variants = []
 
-                for next_line in lines[i + 1:]:
-                    if next_line.strip() and not next_line.startswith("#"):
-                        from urllib.parse import urljoin
-                        variants.append((bandwidth, urljoin(url, next_line.strip())))
-                        break
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF"):
+            match = re.search(r"BANDWIDTH=(\d+)", line)
+            bandwidth = int(match.group(1)) if match else 0
 
-        if not variants:
-            raise RuntimeError("Не удалось найти видеопоток в playlist")
+            for next_line in lines[i + 1:]:
+                next_line = next_line.strip()
 
-        variants.sort(key=lambda x: x[0], reverse=True)
-        return variants[0][1]
+                if next_line and not next_line.startswith("#"):
+                    variants.append(
+                        (bandwidth, urljoin(url, next_line))
+                    )
+                    break
 
-    return url
+    if not variants:
+        raise RuntimeError("Не удалось найти вариант видеопотока")
+
+    variants.sort(key=lambda item: item[0], reverse=True)
+    return variants[0][1]
 
 
 def get_video_duration(playlist_url):
     media_url = resolve_media_playlist(playlist_url)
 
-    response = requests.get(
+    response = request_with_retries(
+        "GET",
         media_url,
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=30
     )
-    response.raise_for_status()
 
     content = response.text
 
@@ -133,19 +168,43 @@ def get_video_duration(playlist_url):
     )
 
     if not durations:
-        raise RuntimeError("Не удалось определить длительность видео")
+        raise RuntimeError("Не удалось определить длительность VOD")
 
-    duration = sum(float(x) for x in durations)
-
-    # Для конечного VOD обязательно ожидаем маркер конца плейлиста.
     if "#EXT-X-ENDLIST" not in content:
         raise RuntimeError(
             "Kick вернул незавершённый playlist. "
-            "Не запускаю бесконечную обработку."
+            "Обработка остановлена."
         )
 
+    duration = sum(float(value) for value in durations)
+
     log.info("VOD duration: %.2f seconds", duration)
+
     return media_url, duration
+
+
+def get_video_info(video_url):
+    with cache_lock:
+        cached = video_cache.get(video_url)
+
+    if cached:
+        log.info("Using cached VOD information")
+        return cached
+
+    log.info("Getting VOD information from Kick")
+
+    playlist_url = get_playback_url(video_url)
+    media_url, duration = get_video_duration(playlist_url)
+
+    result = {
+        "media_url": media_url,
+        "duration": duration
+    }
+
+    with cache_lock:
+        video_cache[video_url] = result
+
+    return result
 
 
 def download_audio_chunk(playlist_url, offset, duration):
@@ -153,6 +212,7 @@ def download_audio_chunk(playlist_url, offset, duration):
         suffix=".mp3",
         delete=False
     )
+
     output_path = temp.name
     temp.close()
 
@@ -180,8 +240,11 @@ def download_audio_chunk(playlist_url, offset, duration):
         error = result.stderr.decode(errors="ignore")[-2000:]
         raise RuntimeError("FFmpeg error: " + error)
 
-    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-        raise RuntimeError("Не удалось скачать аудио этого фрагмента")
+    if (
+        not os.path.exists(output_path)
+        or os.path.getsize(output_path) < 1000
+    ):
+        raise RuntimeError("Не удалось скачать аудио")
 
     return output_path
 
@@ -234,6 +297,7 @@ def transcribe_chunk(audio_path, offset):
         except Exception:
             if attempt == 2:
                 raise
+
             time.sleep(3 * (attempt + 1))
 
 
@@ -247,6 +311,7 @@ def send_callback(payload):
         },
         timeout=60
     )
+
     response.raise_for_status()
     log.info("Callback delivered")
 
@@ -268,22 +333,31 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
     key = f"{job_id}:{chunk_index}"
 
     try:
-        log.info(
-            "Starting job=%s chunk=%s offset=%s",
-            job_id, chunk_index, chunk_index * CHUNK_SECONDS
-        )
-
         offset = chunk_index * CHUNK_SECONDS
 
-        playlist_url = get_playback_url(video_url)
-        media_url, total_duration = get_video_duration(playlist_url)
+        log.info(
+            "Starting job=%s chunk=%s offset=%s",
+            job_id,
+            chunk_index,
+            offset
+        )
 
-        # Главное исправление: достигли конца видео — завершаем задание.
+        # Получаем информацию о видео один раз и используем кэш.
+        video = get_video_info(video_url)
+
+        media_url = video["media_url"]
+        total_duration = video["duration"]
+
+        # Проверяем конец ДО скачивания аудио.
         if offset >= total_duration:
             log.info(
                 "End of VOD reached: offset=%s duration=%s",
-                offset, total_duration
+                offset,
+                total_duration
             )
+
+            with cache_lock:
+                video_cache.pop(video_url, None)
 
             send_callback({
                 "job_id": job_id,
@@ -299,7 +373,8 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
 
         log.info(
             "Downloading chunk=%s duration=%.2f",
-            chunk_index, chunk_duration
+            chunk_index,
+            chunk_duration
         )
 
         audio_path = download_audio_chunk(
@@ -316,7 +391,9 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
 
         log.info(
             "Chunk completed: job=%s chunk=%s segments=%s",
-            job_id, chunk_index, len(segments)
+            job_id,
+            chunk_index,
+            len(segments)
         )
 
         send_callback({
@@ -348,7 +425,9 @@ def health():
 @app.route("/process-chunk", methods=["POST"])
 def process_chunk():
     if not PROCESSOR_SECRET:
-        return jsonify({"error": "Processor secret is not configured"}), 500
+        return jsonify({
+            "error": "Processor secret is not configured"
+        }), 500
 
     if request.headers.get("X-Processor-Secret") != PROCESSOR_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
@@ -387,6 +466,7 @@ def process_chunk():
         args=(job_id, chat_id, video_url, chunk_index),
         daemon=True
     )
+
     thread.start()
 
     return jsonify({
@@ -397,4 +477,7 @@ def process_chunk():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000))
+    )
