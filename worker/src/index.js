@@ -2,12 +2,25 @@ const PROCESSOR_URL = "https://stream-finder-processor.onrender.com";
 const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_CHAT_MODEL = "openai/gpt-oss-120b";
 
-async function telegram(env, chatId, text) {
+const MAIN_KEYBOARD = {
+  keyboard: [
+    [{ text: "📊 Статус" }, { text: "❌ Отменить" }],
+    [{ text: "❓ Как пользоваться" }]
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+
+async function telegram(env, chatId, text, withKeyboard = false) {
   const message = String(text).slice(0, 4000);
   return fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: message })
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: message,
+      ...(withKeyboard ? { reply_markup: MAIN_KEYBOARD } : {})
+    })
   });
 }
 
@@ -105,7 +118,7 @@ async function startJob(env, chatId, url) {
   const job = { job_id: jobId, chat_id: String(chatId), url, platform, next_chunk: 0 };
   await dispatchChunk(env, job);
 
-  await telegram(env, chatId, "Принял запись! Начинаю обработку и расшифровку. Сообщу, когда всё будет готово.");
+  await telegram(env, chatId, "🎬 Принял запись! Начинаю обработку. Сообщу, когда всё будет готово. Статус можно посмотреть кнопкой ниже.", true);
 }
 
 async function processorChunk(request, env) {
@@ -160,7 +173,7 @@ async function processorChunk(request, env) {
       UPDATE streams SET status = 'completed', transcript = ?, error = NULL WHERE job_id = ?
     `).bind(transcript, jobId).run();
 
-    await telegram(env, chatId, "Расшифровка готова! Обработана вся запись.\n\nТеперь можешь задавать вопросы по стриму.");
+    await telegram(env, chatId, "✅ Готово! Обработана вся запись.\n\nТеперь можешь задавать вопросы по стриму.", true);
     return Response.json({ status: "completed" });
   }
 
@@ -347,6 +360,32 @@ async function handleQuestion(env, chatId, question) {
   }
 }
 
+async function showStatus(env, chatId) {
+  const job = await env.DB.prepare(`
+    SELECT job_id, next_chunk, status, updated_at
+    FROM stream_job_state
+    WHERE chat_id = ?
+    ORDER BY updated_at DESC LIMIT 1
+  `).bind(String(chatId)).first();
+
+  if (!job) return telegram(env, chatId, "Пока нет ни одной обработки. Просто отправь ссылку на запись.", true);
+
+  if (job.status === "completed") {
+    return telegram(env, chatId, "✅ Последняя запись полностью обработана. Можешь задавать вопросы по стриму.", true);
+  }
+
+  if (job.status === "cancelled") {
+    return telegram(env, chatId, "❌ Последняя обработка была отменена. Можешь отправить новую ссылку.", true);
+  }
+
+  if (job.status === "processing" || job.status === "running") {
+    const minute = Number(job.next_chunk || 0) * 10;
+    return telegram(env, chatId, `⏳ Идёт обработка. Сейчас обработано примерно до ${minute}-й минуты. Второе видео пока отправлять не нужно.`, true);
+  }
+
+  return telegram(env, chatId, `Статус последней обработки: ${job.status}`, true);
+}
+
 async function cancelJob(env, chatId) {
   const job = await env.DB.prepare(`
     SELECT job_id, next_chunk FROM stream_job_state
@@ -354,7 +393,7 @@ async function cancelJob(env, chatId) {
     ORDER BY updated_at DESC LIMIT 1
   `).bind(String(chatId)).first();
 
-  if (!job) return telegram(env, chatId, "Сейчас у тебя нет активной обработки.");
+  if (!job) return telegram(env, chatId, "Сейчас у тебя нет активной обработки.", true);
 
   await env.DB.prepare(`
     UPDATE stream_job_state SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP, error = 'Cancelled by user'
@@ -367,7 +406,7 @@ async function cancelJob(env, chatId) {
   `).bind(job.job_id).run();
 
   await cancelProcessorJob(env, job.job_id);
-  return telegram(env, chatId, `Обработку отменил. Остановился примерно на ${Number(job.next_chunk || 0) * 10}-й минуте.`);
+  return telegram(env, chatId, `❌ Обработку отменил. Остановился примерно на ${Number(job.next_chunk || 0) * 10}-й минуте.`, true);
 }
 
 async function handleTelegram(update, env) {
@@ -377,11 +416,20 @@ async function handleTelegram(update, env) {
   const chatId = message.chat.id;
   const text = message.text.trim();
 
-  if (text === "/cancel") return cancelJob(env, chatId);
+  if (text === "/cancel" || text === "❌ Отменить") return cancelJob(env, chatId);
+  if (text === "📊 Статус") return showStatus(env, chatId);
+
+  if (text === "❓ Как пользоваться") {
+    return telegram(env, chatId,
+      "1. Отправь ссылку на запись Kick, Twitch или YouTube.\n2. Дождись обработки.\n3. Задавай любые вопросы по содержанию.\n\nНапример: «Он слушал Понасенкова?» или «О чём говорили в начале?»",
+      true
+    );
+  }
 
   if (text === "/start" || text === "/help") {
     return telegram(env, chatId,
-      "Привет! Я Stream Finder.\n\nОтправь ссылку на запись Kick, Twitch или YouTube, и я расшифрую её.\n\nПосле обработки задавай вопросы по содержанию записи.\n\nВо время обработки нельзя запускать вторую запись. Для отмены используй /cancel."
+      "Привет! Я Stream Finder.\n\nОтправь ссылку на запись Kick, Twitch или YouTube — я проанализирую стрим, а потом сможешь задавать вопросы по нему.\n\nКнопки снизу помогут посмотреть статус или отменить обработку.",
+      true
     );
   }
 
