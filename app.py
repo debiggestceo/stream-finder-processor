@@ -9,6 +9,7 @@ import subprocess
 
 import requests
 import yt_dlp
+from yt_dlp.utils import download_range_func
 
 from flask import Flask, request, jsonify
 
@@ -26,10 +27,12 @@ CHUNK_SECONDS = 600
 active_chunks = set()
 active_lock = threading.Lock()
 
-# Кэш целиком скачанных видео. Ключ — job_id.
-jobs = {}
-jobs_lock = threading.Lock()
-
+# Cache metadata only; never keep complete VOD media files on local disk.
+video_metadata = {}
+metadata_locks = {}
+metadata_locks_guard = threading.Lock()
+download_slots = threading.Semaphore(2)
+MAX_TEMP_BYTES = 1500 * 1024 * 1024
 
 def format_time(seconds):
     seconds = int(seconds)
@@ -78,109 +81,117 @@ def detect_platform(url):
     return "YouTube"
 
 
-def download_full_audio(job_id, video_url):
-    folder = tempfile.mkdtemp(prefix=f"stream_{job_id}_")
+def get_video_info(job_id, video_url):
+    with metadata_locks_guard:
+        lock = metadata_locks.setdefault(job_id, threading.Lock())
+
+    with lock:
+        cached = video_metadata.get(job_id)
+        if cached:
+            return cached
+
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "socket_timeout": 40,
+            "retries": 5,
+        }
+
+        log.info("Reading video metadata: job=%s platform=%s", job_id, detect_platform(video_url))
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+
+        if not info:
+            raise RuntimeError("Не удалось получить информацию о видео")
+        if info.get("_type") == "playlist":
+            raise RuntimeError("Отправь ссылку на отдельное видео, не плейлист")
+
+        duration = info.get("duration")
+        if not duration or float(duration) <= 0:
+            raise RuntimeError("Не удалось определить длительность видео")
+
+        result = {
+            "duration": float(duration),
+            "platform": detect_platform(video_url),
+            "title": info.get("title", "Видео")
+        }
+        video_metadata[job_id] = result
+        log.info("Video metadata ready: job=%s duration=%.2f", job_id, result["duration"])
+        return result
+
+
+def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
+    folder = tempfile.mkdtemp(prefix=f"stream_{job_id}_{chunk_index}_")
+
+    def guard_temp_size(_status):
+        total = 0
+        try:
+            for name in os.listdir(folder):
+                path = os.path.join(folder, name)
+                if os.path.isfile(path):
+                    total += os.path.getsize(path)
+        except FileNotFoundError:
+            return
+        if total > MAX_TEMP_BYTES:
+            raise RuntimeError(
+                "Загрузка фрагмента остановлена: временный файл превысил безопасный лимит 1.5 ГБ"
+            )
 
     options = {
-        "format": "bestaudio/best",
+        # Prefer audio-only. If unavailable, use a low-resolution muxed stream and extract audio.
+        "format": "bestaudio/best[height<=240]/best[height<=360]",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 40,
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 5,
+        "fragment_retries": 5,
         "file_access_retries": 3,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 2,
         "continuedl": True,
         "nopart": True,
         "overwrites": False,
+        # yt-dlp downloads only this VOD interval instead of the complete recording.
+        "download_ranges": download_range_func(None, [(offset, offset + duration)]),
+        "progress_hooks": [guard_temp_size],
     }
 
     try:
-        log.info("Downloading full %s video", detect_platform(video_url))
+        log.info(
+            "Downloading ranged chunk: job=%s chunk=%s range=%s-%s",
+            job_id, chunk_index, format_time(offset), format_time(offset + duration)
+        )
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(video_url, download=True)
+        with download_slots:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.extract_info(video_url, download=True)
 
-            if not info:
-                raise RuntimeError("Не удалось получить информацию о видео")
+        candidates = []
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and not name.endswith((".part", ".ytdl")):
+                candidates.append(path)
 
-            if info.get("_type") == "playlist":
-                raise RuntimeError("Отправь ссылку на отдельное видео, не плейлист")
+        if not candidates:
+            raise RuntimeError("yt-dlp не создал файл для выбранного фрагмента")
 
-            duration = info.get("duration")
+        filepath = max(candidates, key=os.path.getsize)
+        size = os.path.getsize(filepath)
+        if size < 1000:
+            raise RuntimeError("Загруженный фрагмент пустой или повреждён")
 
-            if not duration or float(duration) <= 0:
-                raise RuntimeError("Не удалось определить длительность видео")
-
-            filepath = None
-
-            requested = info.get("requested_downloads") or []
-            if requested:
-                filepath = requested[0].get("filepath")
-
-            if not filepath:
-                filepath = info.get("_filename")
-
-            if not filepath:
-                filepath = ydl.prepare_filename(info)
-
-            if not os.path.isfile(filepath):
-                candidates = [
-                    os.path.join(folder, name)
-                    for name in os.listdir(folder)
-                    if os.path.isfile(os.path.join(folder, name))
-                ]
-
-                if candidates:
-                    filepath = max(candidates, key=os.path.getsize)
-
-            if not filepath or not os.path.isfile(filepath):
-                raise RuntimeError("Загруженный аудиофайл не найден")
-
-            if os.path.getsize(filepath) < 1000:
-                raise RuntimeError("Загруженный файл пустой или повреждён")
-
-            log.info(
-                "Full download completed: duration=%.2f file_size=%s",
-                float(duration),
-                os.path.getsize(filepath)
-            )
-
-            return {
-                "folder": folder,
-                "filepath": filepath,
-                "duration": float(duration),
-                "platform": detect_platform(video_url),
-                "title": info.get("title", "Видео")
-            }
+        log.info(
+            "Ranged chunk downloaded: job=%s chunk=%s size=%s",
+            job_id, chunk_index, size
+        )
+        return folder, filepath
 
     except Exception:
         shutil.rmtree(folder, ignore_errors=True)
         raise
-
-
-def get_job_video(job_id, video_url):
-    with jobs_lock:
-        cached = jobs.get(job_id)
-
-    if cached:
-        return cached
-
-    video = download_full_audio(job_id, video_url)
-
-    with jobs_lock:
-        # Защита от повторного создания кэша при одновременном запросе.
-        existing = jobs.get(job_id)
-
-        if existing:
-            shutil.rmtree(video["folder"], ignore_errors=True)
-            return existing
-
-        jobs[job_id] = video
-
-    return video
 
 
 def extract_audio_chunk(source_path, offset, duration):
@@ -312,40 +323,31 @@ def send_error(job_id, chat_id, chunk_index, error):
         log.exception("Could not deliver error callback")
 
 
-def cleanup_job(job_id):
-    with jobs_lock:
-        video = jobs.pop(job_id, None)
-
-    if video:
-        shutil.rmtree(video["folder"], ignore_errors=True)
-        log.info("Temporary files removed: job=%s", job_id)
-
-
 def process_chunk_job(job_id, chat_id, video_url, chunk_index):
     key = f"{job_id}:{chunk_index}"
+    chunk_folder = None
+    audio_path = None
 
     try:
         offset = chunk_index * CHUNK_SECONDS
 
         log.info(
-            "Starting job=%s platform=%s chunk=%s offset=%s",
+            "Starting ranged job=%s platform=%s chunk=%s offset=%s",
             job_id,
             detect_platform(video_url),
             chunk_index,
             offset
         )
 
-        video = get_job_video(job_id, video_url)
+        video = get_video_info(job_id, video_url)
         duration = video["duration"]
 
-        # Видео закончилось: никаких новых скачиваний.
         if offset >= duration:
             log.info(
-                "End of video: duration=%.2f offset=%s",
-                duration,
-                offset
+                "End of video: job=%s duration=%.2f offset=%s",
+                job_id, duration, offset
             )
-
+            video_metadata.pop(job_id, None)
             send_callback({
                 "job_id": job_id,
                 "chat_id": chat_id,
@@ -353,29 +355,15 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
                 "status": "completed",
                 "segments": []
             })
-
-            cleanup_job(job_id)
             return
 
         chunk_duration = min(CHUNK_SECONDS, duration - offset)
-
-        log.info(
-            "Extracting audio: chunk=%s duration=%.2f",
-            chunk_index,
-            chunk_duration
+        chunk_folder, source_path = download_audio_chunk(
+            job_id, video_url, chunk_index, offset, chunk_duration
         )
 
-        audio_path = extract_audio_chunk(
-            video["filepath"],
-            offset,
-            chunk_duration
-        )
-
-        try:
-            segments = transcribe_chunk(audio_path, offset)
-        finally:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
+        audio_path = extract_audio_chunk(source_path, 0, chunk_duration)
+        segments = transcribe_chunk(audio_path, offset)
 
         log.info(
             "Chunk completed: job=%s chunk=%s segments=%s",
@@ -397,6 +385,15 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
         send_error(job_id, chat_id, chunk_index, error)
 
     finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                log.warning("Could not remove temporary audio: %s", audio_path)
+
+        if chunk_folder:
+            shutil.rmtree(chunk_folder, ignore_errors=True)
+
         with active_lock:
             active_chunks.discard(key)
 
