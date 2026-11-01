@@ -246,56 +246,107 @@ def extract_audio_chunk(source_path, offset, duration):
     return output_path
 
 
+def transcribe_chunk_cloudflare(audio_path, offset):
+    """Free fallback ASR through the existing Cloudflare Worker AI binding."""
+    import base64
+
+    with open(audio_path, "rb") as audio:
+        encoded = base64.b64encode(audio.read()).decode("ascii")
+
+    response = requests.post(
+        WORKER_URL + "/transcribe",
+        headers={
+            "Content-Type": "application/json",
+            "x-stream-finder-secret": VISION_SHARED_SECRET
+        },
+        json={"audio": encoded},
+        timeout=600
+    )
+    if response.status_code in (429, 503):
+        raise RuntimeError("Cloudflare ASR quota/rate limit reached")
+    if not response.ok:
+        if "4006" in response.text or "daily free allocation" in response.text.lower():
+            raise RuntimeError("Cloudflare ASR daily free quota exhausted")
+        response.raise_for_status()
+
+    data = response.json()
+    raw_segments = data.get("segments") or []
+    if not raw_segments and data.get("text"):
+        raw_segments = [{"start": 0, "end": 0, "text": data["text"]}]
+
+    segments = []
+    for item in raw_segments:
+        start = float(item.get("start", 0)) + offset
+        end = float(item.get("end", item.get("start", 0))) + offset
+        text = str(item.get("text", "")).strip()
+        if text:
+            segments.append({
+                "start": start,
+                "end": end,
+                "time": format_time(start),
+                "text": text
+            })
+    return segments
+
+
 def transcribe_chunk(audio_path, offset):
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY не настроен")
+    """Groq first; switch to Cloudflare automatically on quota or provider failure."""
+    groq_error = None
+    if GROQ_API_KEY:
+        endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
+        for attempt in range(3):
+            try:
+                with open(audio_path, "rb") as audio:
+                    response = requests.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        data={
+                            "model": "whisper-large-v3-turbo",
+                            "response_format": "verbose_json",
+                            "timestamp_granularities[]": "segment"
+                        },
+                        files={"file": ("audio.mp3", audio, "audio/mpeg")},
+                        timeout=600
+                    )
+                if response.status_code == 429:
+                    groq_error = "Groq ASR quota/rate limit reached (HTTP 429)"
+                    log.warning("%s; switching to Cloudflare ASR", groq_error)
+                    break
+                if response.status_code in (401, 403):
+                    response.raise_for_status()
+                response.raise_for_status()
+                data = response.json()
+                segments = []
+                for item in data.get("segments", []):
+                    start = float(item.get("start", 0)) + offset
+                    end = float(item.get("end", 0)) + offset
+                    text = item.get("text", "").strip()
+                    if text:
+                        segments.append({
+                            "start": start, "end": end,
+                            "time": format_time(start), "text": text
+                        })
+                log.info("Transcription provider: Groq")
+                return segments
+            except requests.RequestException as error:
+                groq_error = str(error)[:300]
+                if attempt < 2 and not (getattr(error.response, "status_code", None) in (401, 403)):
+                    time.sleep(3 * (attempt + 1))
+                else:
+                    break
+    else:
+        groq_error = "GROQ_API_KEY not configured"
 
-    endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
-
-    for attempt in range(3):
-        try:
-            with open(audio_path, "rb") as audio:
-                response = requests.post(
-                    endpoint,
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}"
-                    },
-                    data={
-                        "model": "whisper-large-v3-turbo",
-                        "response_format": "verbose_json",
-                        "timestamp_granularities[]": "segment"
-                    },
-                    files={
-                        "file": ("audio.mp3", audio, "audio/mpeg")
-                    },
-                    timeout=600
-                )
-
-            response.raise_for_status()
-            data = response.json()
-
-            segments = []
-
-            for item in data.get("segments", []):
-                start = float(item.get("start", 0)) + offset
-                end = float(item.get("end", 0)) + offset
-                text = item.get("text", "").strip()
-
-                if text:
-                    segments.append({
-                        "start": start,
-                        "end": end,
-                        "time": format_time(start),
-                        "text": text
-                    })
-
-            return segments
-
-        except Exception:
-            if attempt == 2:
-                raise
-
-            time.sleep(3 * (attempt + 1))
+    log.warning("Groq ASR unavailable (%s); trying Cloudflare fallback", groq_error)
+    try:
+        segments = transcribe_chunk_cloudflare(audio_path, offset)
+        log.info("Transcription provider: Cloudflare Workers AI")
+        return segments
+    except Exception as cloudflare_error:
+        raise RuntimeError(
+            "Обе платформы транскрибации недоступны. "
+            f"Groq: {groq_error}; Cloudflare: {str(cloudflare_error)[:400]}"
+        ) from cloudflare_error
 
 
 VISION_PROMPT = (
@@ -369,6 +420,7 @@ def analyze_video_frames(source_path, offset, duration):
     results = []
     attempted = extracted = empty = 0
     provider = "Groq" if GROQ_API_KEY else "Cloudflare"
+    groq_vision_disabled_for_chunk = False
     log.info("Vision started: provider=%s offset=%s frames=%s interval=%ss",
              provider, format_time(offset), len(positions), VISION_FRAME_INTERVAL)
 
@@ -391,13 +443,16 @@ def analyze_video_frames(source_path, offset, duration):
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
 
             description, groq_status = (None, "not_configured")
-            if GROQ_API_KEY:
+            if GROQ_API_KEY and not groq_vision_disabled_for_chunk:
                 description, groq_status = analyze_frame_groq(encoded)
                 if groq_status == "quota":
-                    break
+                    log.warning("Groq vision quota exhausted; switching remaining frames to Cloudflare")
+                    groq_vision_disabled_for_chunk = True
+            elif groq_vision_disabled_for_chunk:
+                groq_status = "quota"
 
-            # Cloudflare is only a free fallback for temporary/provider errors.
-            if description is None and groq_status not in ("quota", "configuration"):
+            # Cloudflare fallback is also attempted when Groq quota is exhausted.
+            if description is None and groq_status != "configuration":
                 response = requests.post(
                     WORKER_URL + "/vision",
                     headers={"Content-Type": "application/json",
