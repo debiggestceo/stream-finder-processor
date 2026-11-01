@@ -145,9 +145,8 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
             )
 
     options = {
-        # Keep a muxed video+audio source: the visual analyzer needs video frames.
-        # Cap resolution to keep temporary downloads within the worker's disk budget.
-        "format": "best[height<=360]/bestvideo[height<=360]+bestaudio/best[height<=480]",
+        # Audio-only download: avoids video bandwidth and all vision-model quota usage.
+        "format": "bestaudio/best",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -614,9 +613,8 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
         if job_id in cancelled_jobs:
             return
 
-        # Visual analysis runs on the downloaded chunk before it is deleted.
-        video_segments = analyze_video_frames(source_path, offset, chunk_duration)
-        segments.extend(video_segments)
+        # Audio-only mode: no frame extraction or vision API calls.
+        video_segments = []
         segments.sort(key=lambda item: float(item.get("start", 0)))
 
         log.info(
@@ -658,7 +656,7 @@ def health():
     return jsonify({
         "status": "Stream Finder Processor is online",
         "groq_configured": bool(GROQ_API_KEY),
-        "vision_enabled": bool(VISION_SHARED_SECRET) and VISION_ENABLED,
+        "vision_enabled": False,
         "vision_frame_interval_seconds": VISION_FRAME_INTERVAL,
         "vision_provider": "groq" if GROQ_API_KEY else "cloudflare",
         "vision_model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b") if GROQ_API_KEY else VISION_MODEL,
