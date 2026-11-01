@@ -22,7 +22,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 VISION_SHARED_SECRET = os.getenv("PROCESSOR_SECRET")
 VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
-VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+VISION_MODEL = os.getenv("VISION_MODEL", "@cf/qwen/qwen3.8-27b")
+VISION_FRAME_INTERVAL = 30
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 
@@ -302,7 +303,7 @@ def analyze_video_frames(source_path, offset, duration):
     if not VISION_ENABLED or not VISION_SHARED_SECRET:
         return []
 
-    positions = [min(duration - 1, t) for t in range(30, max(31, int(duration)), 60)]
+    positions = [min(duration - 1, t) for t in range(0, max(1, int(duration)), VISION_FRAME_INTERVAL)]
     if not positions:
         positions = [max(0, int(duration // 2))]
 
@@ -337,14 +338,22 @@ def analyze_video_frames(source_path, offset, duration):
             )
 
             if response.status_code in (429, 503):
-                log.warning("Cloudflare Workers AI temporarily limited; skipping frame (%s)", response.status_code)
+                log.warning("Cloudflare Workers AI temporarily limited; skipping frame at %s (%s)", format_time(offset + local_time), response.status_code)
                 continue
-            response.raise_for_status()
-            description = (response.json().get("result") or "").strip()
+            if not response.ok:
+                log.error("Vision endpoint failed at %s: HTTP %s %s", format_time(offset + local_time), response.status_code, response.text[:400])
+                response.raise_for_status()
+            payload = response.json()
+            description = payload.get("result") if isinstance(payload, dict) else None
+            if not isinstance(description, str):
+                log.warning("Vision endpoint returned no text at %s: %s", format_time(offset + local_time), str(payload)[:300])
+                continue
+            description = description.strip()
 
             if description and description.upper() not in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
                 description = " ".join(description.split())[:180]
                 absolute_time = offset + local_time
+                log.info("Vision recognized frame at %s: %s", format_time(absolute_time), description[:140])
                 results.append({
                     "start": absolute_time,
                     "end": absolute_time,
@@ -499,7 +508,8 @@ def health():
     return jsonify({
         "status": "Stream Finder Processor is online",
         "groq_configured": bool(GROQ_API_KEY),
-        "vision_enabled": bool(GROQ_API_KEY) and VISION_ENABLED,
+        "vision_enabled": bool(VISION_SHARED_SECRET) and VISION_ENABLED,
+        "vision_frame_interval_seconds": VISION_FRAME_INTERVAL,
         "vision_model": VISION_MODEL,
         "processor_secret_configured": bool(PROCESSOR_SECRET),
         "platforms": ["Kick", "Twitch", "YouTube"]
