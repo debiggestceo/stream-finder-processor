@@ -32,7 +32,7 @@ video_metadata = {}
 metadata_locks = {}
 metadata_locks_guard = threading.Lock()
 download_slots = threading.Semaphore(2)
-MAX_TEMP_BYTES = 1500 * 1024 * 1024
+MAX_TEMP_BYTES = 600 * 1024 * 1024
 
 def format_time(seconds):
     seconds = int(seconds)
