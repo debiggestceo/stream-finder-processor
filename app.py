@@ -377,14 +377,14 @@ def analyze_video_frames(source_path, offset, duration):
                 continue
 
             description = " ".join(description.split())[:180]
-                absolute_time = offset + local_time
-                log.info("Vision recognized frame at %s: %s", format_time(absolute_time), description[:140])
-                results.append({
-                    "start": absolute_time,
-                    "end": absolute_time,
-                    "time": format_time(absolute_time),
-                    "text": "[ВИДЕО-МЕТКА] " + description
-                })
+            absolute_time = offset + local_time
+            log.info("Vision recognized frame at %s: %s", format_time(absolute_time), description[:140])
+            results.append({
+                "start": absolute_time,
+                "end": absolute_time,
+                "time": format_time(absolute_time),
+                "text": "[ВИДЕО-МЕТКА] " + description
+            })
         except Exception:
             log.exception("Cloudflare vision analysis failed for frame")
         finally:
