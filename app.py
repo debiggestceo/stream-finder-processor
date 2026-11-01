@@ -370,8 +370,8 @@ def analyze_frames_groq(frames):
         "text": (
             "Определи содержимое каждого кадра отдельно. Верни строго по одной строке "
             "на каждый кадр в формате N: короткая метка на русском или NONE. "
-            "Не объединяй кадры и не додумывай.\\n" +
-            "\\n".join(f"КАДР {i + 1}, таймкод {format_time(item['time'])}" for i, item in enumerate(frames))
+            "Не объединяй кадры и не додумывай.\n" +
+            "\n".join(f"КАДР {i + 1}, таймкод {format_time(item['time'])}" for i, item in enumerate(frames))
         )
     }]
     for item in frames:
