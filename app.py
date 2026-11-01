@@ -299,8 +299,48 @@ def transcribe_chunk(audio_path, offset):
             time.sleep(3 * (attempt + 1))
 
 
+def analyze_frame_gemini(image_base64):
+    """Use the existing Gemini key; stop rather than risk paid fallback on quota limits."""
+    if not GEMINI_API_KEY:
+        return None, "not_configured"
+    model = os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash")
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {"contents": [{"parts": [
+        {"text": VISION_PROMPT},
+        {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
+    ]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 160}}
+    try:
+        response = requests.post(endpoint, headers={
+            "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"
+        }, json=payload, timeout=90)
+        if response.status_code in (403, 429):
+            log.warning("Gemini quota/access limit reached (HTTP %s); stopping visual scan. No paid fallback.", response.status_code)
+            return None, "quota"
+        response.raise_for_status()
+        data = response.json()
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        answer = " ".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        return answer.strip() or "NONE", "ok"
+    except requests.RequestException as error:
+        log.warning("Gemini request failed: %s", str(error)[:300])
+        return None, "error"
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        log.warning("Gemini response parse failed: %s", str(error)[:200])
+        return None, "error"
+
+
+VISION_PROMPT = (
+    "Ты анализируешь отдельный кадр записи стрима. Определи, что видно на экране: "
+    "игра, видео в браузере/плеере, сайт, человек или приложение. Для игр используй "
+    "узнаваемый интерфейс, HUD, персонажей, локации и графику; если уверенно узнаёшь игру, "
+    "назови её. Для видео ищи заголовок, автора, субтитры и узнаваемые детали. "
+    "Не путай просмотр игры с тем, что сам стример играет. Верни короткую конкретную "
+    "метку на русском. Не додумывай детали. Если определить нельзя, ответь строго NONE."
+)
+
+
 def analyze_video_frames(source_path, offset, duration):
-    """Send sampled frames to our Cloudflare Worker, which runs Workers AI."""
+    """Gemini is primary; existing Cloudflare Workers AI is fallback only for transport errors."""
     if not VISION_ENABLED:
         log.error("Vision analysis disabled by VISION_ENABLED=false")
         return []
@@ -309,87 +349,66 @@ def analyze_video_frames(source_path, offset, duration):
         return []
 
     positions = [min(duration - 1, t) for t in range(0, max(1, int(duration)), VISION_FRAME_INTERVAL)]
-    if not positions:
-        positions = [max(0, int(duration // 2))]
-
     results = []
-    attempted = 0
-    extracted = 0
-    empty = 0
-    log.info(
-        "Vision analysis started: offset=%s duration=%.2f frames=%s interval=%ss",
-        format_time(offset), duration, len(positions), VISION_FRAME_INTERVAL
-    )
+    attempted = extracted = empty = 0
+    provider = "Gemini" if GEMINI_API_KEY else "Cloudflare"
+    log.info("Vision started: provider=%s offset=%s frames=%s interval=%ss",
+             provider, format_time(offset), len(positions), VISION_FRAME_INTERVAL)
+
     for local_time in positions:
         attempted += 1
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         frame_path = frame.name
         frame.close()
         try:
-            command = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(local_time), "-i", source_path,
-                "-frames:v", "1", "-vf", "scale=768:-2",
-                "-q:v", "4", frame_path
-            ]
+            command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                       "-ss", str(local_time), "-i", source_path,
+                       "-frames:v", "1", "-vf", "scale=768:-2", "-q:v", "4", frame_path]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-            if result.returncode != 0:
-                log.warning(
-                    "Vision frame extraction failed at %s: ffmpeg_exit=%s stderr=%s",
-                    format_time(offset + local_time), result.returncode,
-                    result.stderr.decode("utf-8", errors="replace")[:500]
-                )
-                continue
-            if not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
-                log.warning("Vision frame extraction produced an empty image at %s", format_time(offset + local_time))
+            if result.returncode != 0 or not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
+                log.warning("Frame extraction failed at %s", format_time(offset + local_time))
                 continue
             extracted += 1
-
             import base64
             with open(frame_path, "rb") as image_file:
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
 
-            response = requests.post(
-                WORKER_URL + "/vision",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-stream-finder-secret": VISION_SHARED_SECRET
-                },
-                json={"image": encoded},
-                timeout=120
-            )
+            description, gemini_status = (None, "not_configured")
+            if GEMINI_API_KEY:
+                description, gemini_status = analyze_frame_gemini(encoded)
+                if gemini_status == "quota":
+                    break
 
-            if response.status_code in (429, 503):
-                log.warning("Cloudflare Workers AI temporarily limited; stopping visual scan for this chunk at %s (%s)", format_time(offset + local_time), response.status_code)
-                break
-            if not response.ok and ("4006" in response.text or "daily free allocation" in response.text.lower()):
-                log.error("Cloudflare Workers AI daily free neuron quota exhausted; stopping visual scan for this chunk at %s. No paid fallback will be used.", format_time(offset + local_time))
-                break
-            if not response.ok:
-                log.error("Vision endpoint failed at %s: HTTP %s %s", format_time(offset + local_time), response.status_code, response.text[:400])
+            if description is None and gemini_status != "quota":
+                response = requests.post(
+                    WORKER_URL + "/vision",
+                    headers={"Content-Type": "application/json",
+                             "x-stream-finder-secret": VISION_SHARED_SECRET},
+                    json={"image": encoded}, timeout=120)
+                if response.status_code in (429, 503):
+                    log.warning("Cloudflare vision limited (HTTP %s); stopping scan", response.status_code)
+                    break
+                if not response.ok and ("4006" in response.text or "daily free allocation" in response.text.lower()):
+                    log.error("Cloudflare daily free quota exhausted. No paid fallback.")
+                    break
                 response.raise_for_status()
-            payload = response.json()
-            description = payload.get("result") if isinstance(payload, dict) else None
-            if not isinstance(description, str):
-                log.warning("Vision endpoint returned no text at %s: %s", format_time(offset + local_time), str(payload)[:300])
-                continue
-            description = description.strip()
+                payload = response.json()
+                description = payload.get("result") if isinstance(payload, dict) else None
 
+            if not isinstance(description, str):
+                continue
+            description = " ".join(description.strip().split())
             if not description or description.upper() in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
                 empty += 1
                 continue
 
-            description = " ".join(description.split())[:180]
             absolute_time = offset + local_time
-            log.info("Vision recognized frame at %s: %s", format_time(absolute_time), description[:140])
-            results.append({
-                "start": absolute_time,
-                "end": absolute_time,
-                "time": format_time(absolute_time),
-                "text": "[ВИДЕО-МЕТКА] " + description
-            })
+            log.info("Vision recognized at %s: %s", format_time(absolute_time), description[:140])
+            results.append({"start": absolute_time, "end": absolute_time,
+                            "time": format_time(absolute_time),
+                            "text": "[ВИДЕО-МЕТКА] " + description[:180]})
         except Exception:
-            log.exception("Cloudflare vision analysis failed for frame")
+            log.exception("Vision analysis failed at %s", format_time(offset + local_time))
         finally:
             try:
                 if os.path.exists(frame_path):
@@ -397,10 +416,8 @@ def analyze_video_frames(source_path, offset, duration):
             except OSError:
                 pass
 
-    log.info(
-        "Vision analysis finished: offset=%s attempted=%s extracted=%s empty=%s recognized=%s",
-        format_time(offset), attempted, extracted, empty, len(results)
-    )
+    log.info("Vision finished: provider=%s offset=%s attempted=%s extracted=%s empty=%s recognized=%s",
+             provider, format_time(offset), attempted, extracted, empty, len(results))
     return results
 
 def send_callback(payload):
@@ -542,7 +559,8 @@ def health():
         "groq_configured": bool(GROQ_API_KEY),
         "vision_enabled": bool(VISION_SHARED_SECRET) and VISION_ENABLED,
         "vision_frame_interval_seconds": VISION_FRAME_INTERVAL,
-        "vision_model": VISION_MODEL,
+        "vision_model": os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash") if GEMINI_API_KEY else VISION_MODEL,
+        "gemini_configured": bool(GEMINI_API_KEY),
         "processor_secret_configured": bool(PROCESSOR_SECRET),
         "platforms": ["Kick", "Twitch", "YouTube"]
     })
