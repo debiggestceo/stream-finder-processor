@@ -407,6 +407,24 @@ async function cancelJob(env, chatId) {
   return telegram(env, chatId, `❌ Обработку отменил. Остановился примерно на ${Number(job.next_chunk || 0) * 10}-й минуте.`, true);
 }
 
+async function analyzeFrameWithAI(env, imageBase64) {
+  const prompt = "Проанализируй кадр стрима. Найди только конкретные проверяемые признаки: узнаваемого публичного человека, исполнителя, название видео, канала или игры, крупный читаемый текст или важное действие. Если ничего конкретного и уверенного нет — ответь строго NONE. Если есть — одна короткая точная поисковая метка.";
+
+  const answer = await env.AI.run("@cf/qwen/qwen3.8-27b", {
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64," + imageBase64 } }
+      ]
+    }],
+    max_tokens: 120,
+    temperature: 0.1
+  });
+
+  return String(answer?.response || answer?.result?.response || answer || "NONE").trim();
+}
+
 async function handleTelegram(update, env) {
   const message = update.message;
   if (!message?.text || !message.chat?.id) return;
@@ -465,6 +483,20 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       return Response.json({ status: "Stream Finder Worker online" });
+    }
+
+    if (request.method === "POST" && url.pathname === "/vision") {
+      try {
+        if (!env.VISION_SHARED_SECRET || request.headers.get("x-stream-finder-secret") !== env.VISION_SHARED_SECRET) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        const body = await request.json();
+        if (!body?.image) return Response.json({ error: "image is required" }, { status: 400 });
+        return Response.json({ result: await analyzeFrameWithAI(env, body.image) });
+      } catch (error) {
+        console.error("Workers AI vision error:", error);
+        return Response.json({ error: String(error?.message || error) }, { status: 500 });
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/processor-chunk") {
