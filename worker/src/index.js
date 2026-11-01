@@ -197,13 +197,13 @@ function timeToSeconds(value) {
 function detectTimeScope(question, segments) {
   const q = normalizeText(question);
   const last = segments.reduce((max, s) => Math.max(max, timeToSeconds(s.end_time || s.start_time)), 0);
-  if (/\\b(начал|с самого начала|первые минуты|первую минут|в начале|начало видео|начало стрима)\\b/.test(q)) {
+  if (/(начал|с самого начала|первые минуты|первую минут|в начале|начало видео|начало стрима)/.test(q)) {
     return { label: "начало записи", from: 0, to: Math.min(180, last || 180) };
   }
-  if (/\\b(конц|под конец|в конце|последние минуты|последнюю минут)\\b/.test(q)) {
+  if (/(конц|под конец|в конце|последние минуты|последнюю минут)/.test(q)) {
     return { label: "конец записи", from: Math.max(0, last - 180), to: last || 180 };
   }
-  if (/\\b(середин|в середине|примерно посередине)\\b/.test(q)) {
+  if (/(середин|в середине|примерно посередине)/.test(q)) {
     const center = last / 2;
     return { label: "середина записи", from: Math.max(0, center - 90), to: Math.min(last, center + 90) };
   }
