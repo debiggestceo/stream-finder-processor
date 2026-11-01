@@ -27,6 +27,7 @@ WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 CHUNK_SECONDS = 600
 
 active_chunks = set()
+cancelled_jobs = set()
 active_lock = threading.Lock()
 
 # Cache metadata only; never keep complete VOD media files on local disk.
@@ -407,6 +408,10 @@ def send_callback(payload):
 
 def send_error(job_id, chat_id, chunk_index, error):
     try:
+        if job_id in cancelled_jobs:
+            log.info("Job cancelled before callback: %s", job_id)
+            return
+
         send_callback({
             "job_id": job_id,
             "chat_id": chat_id,
@@ -424,6 +429,10 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
     audio_path = None
 
     try:
+        if job_id in cancelled_jobs:
+            log.info("Job cancelled before start: %s", job_id)
+            return
+
         offset = chunk_index * CHUNK_SECONDS
 
         log.info(
@@ -433,6 +442,9 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
             chunk_index,
             offset
         )
+
+        if job_id in cancelled_jobs:
+            return
 
         video = get_video_info(job_id, video_url)
         duration = video["duration"]
@@ -453,12 +465,21 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
             return
 
         chunk_duration = min(CHUNK_SECONDS, duration - offset)
+        if job_id in cancelled_jobs:
+            return
+
         chunk_folder, source_path = download_audio_chunk(
             job_id, video_url, chunk_index, offset, chunk_duration
         )
 
+        if job_id in cancelled_jobs:
+            return
+
         audio_path = extract_audio_chunk(source_path, 0, chunk_duration)
         segments = transcribe_chunk(audio_path, offset)
+
+        if job_id in cancelled_jobs:
+            return
 
         # Visual analysis runs on the downloaded chunk before it is deleted.
         video_segments = analyze_video_frames(source_path, offset, chunk_duration)
@@ -509,6 +530,23 @@ def health():
         "processor_secret_configured": bool(PROCESSOR_SECRET),
         "platforms": ["Kick", "Twitch", "YouTube"]
     })
+
+
+@app.route("/cancel-job", methods=["POST"])
+def cancel_job():
+    if not PROCESSOR_SECRET:
+        return jsonify({"error": "Processor secret is not configured"}), 500
+    if request.headers.get("X-Processor-Secret") != PROCESSOR_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    job_id = str(data.get("job_id") or "")
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+
+    cancelled_jobs.add(job_id)
+    log.info("Cancellation requested for job=%s", job_id)
+    return jsonify({"status": "cancellation_requested", "job_id": job_id})
 
 
 @app.route("/process-chunk", methods=["POST"])
