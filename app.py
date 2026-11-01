@@ -305,6 +305,9 @@ def analyze_video_frames(source_path, offset, duration):
     sample_count = max(1, int(duration // 30))
     positions = [min(duration - 1, i * 30 + 15) for i in range(sample_count)]
     results = []
+    # Groq free-tier vision requests are rate-limited. Pace requests and back off
+    # on 429 instead of wasting the whole visual pass.
+    vision_delay = 3
 
     for local_time in positions:
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -331,37 +334,42 @@ def analyze_video_frames(source_path, offset, duration):
             # Vision models do not accept arbitrary local URLs; send the sampled frame
             # as a data URL. If the configured model/provider rejects vision, this is
             # treated as a non-fatal enhancement failure.
-            response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": VISION_MODEL,
-                    "temperature": 0.1,
-                    "max_tokens": 300,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Проверь кадр на конкретные узнаваемые объекты, полезные для поиска по стриму: "
-                                    "известный человек, исполнитель, название видео/канала, игра, крупный читаемый текст "
-                                    "или важное действие. Если такого конкретного признака нет или ты не уверен — ответь ровно: NONE. "
-                                    "Если есть — дай ОДНУ очень короткую поисковую метку без описания кадра. Не пересказывай интерфейс и не выдумывай."
-                                )
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": "data:image/jpeg;base64," + encoded}
-                            }
-                        ]
-                    }]
-                },
-                timeout=120
-            )
+            payload = {
+                "model": VISION_MODEL,
+                "temperature": 0.1,
+                "max_tokens": 120,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Проверь кадр на конкретные узнаваемые объекты, полезные для поиска по стриму: "
+                                "известный человек, исполнитель, название видео/канала, игра, крупный читаемый текст "
+                                "или важное действие. Если такого конкретного признака нет или ты не уверен — ответь ровно: NONE. "
+                                "Если есть — дай ОДНУ очень короткую поисковую метку без описания кадра."
+                            )
+                        },
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}}
+                    ]
+                }]
+            }
+            response = None
+            for attempt in range(4):
+                response = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json=payload, timeout=120
+                )
+                if response.status_code != 429:
+                    break
+                retry_after = response.headers.get("retry-after")
+                try:
+                    wait = float(retry_after) if retry_after else min(30, 5 * (2 ** attempt))
+                except ValueError:
+                    wait = min(30, 5 * (2 ** attempt))
+                log.warning("Vision rate limited; waiting %.1fs before retry", wait)
+                time.sleep(wait)
             response.raise_for_status()
             description = response.json()["choices"][0]["message"]["content"].strip()
             # Store only a compact searchable marker. Generic frame descriptions are
@@ -384,6 +392,9 @@ def analyze_video_frames(source_path, offset, duration):
                     os.remove(frame_path)
             except OSError:
                 pass
+
+        # Pace successful/failed frame requests to stay below provider request limits.
+        time.sleep(vision_delay)
 
     return results
 
