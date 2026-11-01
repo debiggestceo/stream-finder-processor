@@ -408,7 +408,7 @@ async function cancelJob(env, chatId) {
 }
 
 async function analyzeFrameWithAI(env, imageBase64) {
-  const prompt = "Проанализируй кадр стрима. Найди только конкретные проверяемые признаки: узнаваемого публичного человека, исполнителя, название видео, канала или игры, крупный читаемый текст или важное действие. Если ничего конкретного и уверенного нет — ответь строго NONE. Если есть — одна короткая точная поисковая метка.";
+  const prompt = "Внимательно изучи кадр записи стрима. Это может быть экран браузера, видеоплеер, музыкальный клип, обложка альбома, соцсеть или лицо человека. Ищи конкретные визуальные доказательства: узнаваемого публичного человека или исполнителя (только если уверен), название/имя в заголовке плеера или на экране, название ролика/песни/канала, субтитры, логотипы и крупный читаемый текст. Если на экране воспроизводится чужое видео или музыкальный клип, опиши, что именно видно, и перепиши читаемый заголовок/имя. Не делай вывод по одному лишь сходству или общему виду. Не выдумывай. Если нет конкретного проверяемого признака — ответь строго NONE. Иначе верни одну короткую поисковую метку на русском языке, сохранив имена и названия как можно точнее.";
 
   const answer = await env.AI.run("@cf/qwen/qwen3.8-27b", {
     messages: [{
@@ -418,11 +418,24 @@ async function analyzeFrameWithAI(env, imageBase64) {
         { type: "image_url", image_url: { url: "data:image/jpeg;base64," + imageBase64 } }
       ]
     }],
-    max_tokens: 120,
+    max_tokens: 160,
     temperature: 0.1
   });
 
-  return String(answer?.response || answer?.result?.response || answer || "NONE").trim();
+  const candidates = [
+    answer?.response,
+    answer?.result?.response,
+    answer?.choices?.[0]?.message?.content,
+    answer?.result?.choices?.[0]?.message?.content,
+    answer?.output_text,
+    answer?.result?.output_text
+  ];
+  const text = candidates.find(value => typeof value === "string");
+  if (typeof text !== "string") {
+    console.error("Unexpected Workers AI response shape:", JSON.stringify(answer).slice(0, 500));
+    return "NONE";
+  }
+  return text.trim() || "NONE";
 }
 
 async function handleTelegram(update, env) {
