@@ -188,6 +188,28 @@ async function expandSearchTerms(env, question) {
   }
 }
 
+function timeToSeconds(value) {
+  const parts = String(value || "00:00:00").split(":").map(Number);
+  if (parts.length !== 3 || parts.some(n => !Number.isFinite(n))) return 0;
+  return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+function detectTimeScope(question, segments) {
+  const q = normalizeText(question);
+  const last = segments.reduce((max, s) => Math.max(max, timeToSeconds(s.end_time || s.start_time)), 0);
+  if (/\\b(начал|с самого начала|первые минуты|первую минут|в начале|начало видео|начало стрима)\\b/.test(q)) {
+    return { label: "начало записи", from: 0, to: Math.min(180, last || 180) };
+  }
+  if (/\\b(конц|под конец|в конце|последние минуты|последнюю минут)\\b/.test(q)) {
+    return { label: "конец записи", from: Math.max(0, last - 180), to: last || 180 };
+  }
+  if (/\\b(середин|в середине|примерно посередине)\\b/.test(q)) {
+    const center = last / 2;
+    return { label: "середина записи", from: Math.max(0, center - 90), to: Math.min(last, center + 90) };
+  }
+  return null;
+}
+
 async function handleQuestion(env, chatId, question) {
   const stream = await env.DB.prepare(`
     SELECT job_id, status FROM streams WHERE chat_id = ? ORDER BY id DESC LIMIT 1
@@ -196,10 +218,6 @@ async function handleQuestion(env, chatId, question) {
   if (!stream) return telegram(env, chatId, "Сначала отправь ссылку на запись Kick, Twitch или YouTube.");
   if (stream.status !== "completed") return telegram(env, chatId, "Запись ещё обрабатывается. Задай вопрос после завершения.");
 
-  const terms = await expandSearchTerms(env, question);
-  const normalizedTerms = terms.map(normalizeText).filter(Boolean);
-  const words = normalizeText(question).split(" ").filter(w => w.length > 2 && !STOP_WORDS.has(w));
-
   const rows = await env.DB.prepare(`
     SELECT start_time, end_time, transcript FROM stream_segments WHERE job_id = ? ORDER BY segment_index
   `).bind(stream.job_id).all();
@@ -207,23 +225,52 @@ async function handleQuestion(env, chatId, question) {
   const segments = rows.results || [];
   if (!segments.length) return telegram(env, chatId, "В этой записи пока нет сохранённой расшифровки.");
 
-  const ranked = segments.map(segment => {
-    const text = normalizeText(segment.transcript);
-    let score = 0;
-    for (const term of normalizedTerms) {
-      const normalized = normalizeText(term);
-      if (normalized.length > 2 && text.includes(normalized)) score += 3;
-    }
-    for (const word of words) if (text.includes(word)) score += 1;
-    return { ...segment, score };
-  }).filter(s => s.score > 0).sort((a,b) => b.score - a.score).slice(0, 50);
+  const scope = detectTimeScope(question, segments);
+  let selected = [];
 
-  if (!env.GROQ_API_KEY) {
-    if (!ranked.length) return telegram(env, chatId, "Поиск не нашёл совпадений в расшифровке.");
-    return telegram(env, chatId, ranked.slice(0, 10).map(s => `[${s.start_time}] ${s.transcript}`).join("\n"));
+  if (scope) {
+    selected = segments.filter(s => {
+      const t = timeToSeconds(s.start_time);
+      return t >= scope.from && t <= scope.to;
+    }).slice(0, 60);
+  } else {
+    const terms = await expandSearchTerms(env, question);
+    const normalizedTerms = terms.map(normalizeText).filter(Boolean);
+    const words = normalizeText(question).split(" ").filter(w => w.length > 2 && !STOP_WORDS.has(w));
+
+    const ranked = segments.map((segment, index) => {
+      const text = normalizeText(segment.transcript);
+      let score = 0;
+      for (const term of normalizedTerms) {
+        const normalized = normalizeText(term);
+        if (normalized.length > 2 && text.includes(normalized)) score += 3;
+      }
+      for (const word of words) if (text.includes(word)) score += 1;
+      return { ...segment, index, score };
+    }).filter(s => s.score > 0).sort((a,b) => b.score - a.score).slice(0, 12);
+
+    // Добавляем соседние реплики: они помогают понять смысл плохо распознанной фразы.
+    const indexes = new Set();
+    for (const hit of ranked) {
+      for (let i = Math.max(0, hit.index - 2); i <= Math.min(segments.length - 1, hit.index + 2); i++) indexes.add(i);
+    }
+    selected = [...indexes].sort((a,b) => a-b).slice(0, 45).map(i => segments[i]);
   }
 
-  const context = ranked.length ? ranked.map(s => `[${s.start_time}] ${s.transcript}`).join("\n") : "Поиск по расшифровке не нашёл совпадений.";
+  if (!selected.length) {
+    return telegram(env, chatId, scope
+      ? `В ${scope.label} не нашлось распознанной речи.`
+      : "Не нашёл подходящих фрагментов в расшифровке. Попробуй сформулировать вопрос иначе.");
+  }
+
+  const context = selected.map(s => {
+    const text = String(s.transcript || "").trim();
+    return `[${s.start_time}] ${text}`;
+  }).join("\\n");
+
+  if (!env.GROQ_API_KEY) {
+    return telegram(env, chatId, selected.slice(0, 10).map(s => `[${s.start_time}] ${s.transcript}`).join("\\n"));
+  }
 
   try {
     const response = await fetch(GROQ_CHAT_URL, {
@@ -232,8 +279,8 @@ async function handleQuestion(env, chatId, question) {
       body: JSON.stringify({
         model: GROQ_CHAT_MODEL, temperature: 0,
         messages: [
-          { role: "system", content: "Ты анализируешь расшифровку стрима. Отвечай по-русски и кратко. Используй только предоставленные фрагменты. Не выдумывай факты и таймкоды. Если доказательств нет, скажи, что по найденным фрагментам подтвердить это нельзя. Если вопрос предполагает да/нет, сначала дай ответ, затем примеры с таймкодами." },
-          { role: "user", content: `Вопрос: ${question}\n\nФрагменты расшифровки:\n${context}` }
+          { role: "system", content: "Ты анализируешь автоматическую расшифровку стрима. Отвечай по-русски, естественно и кратко. Используй только предоставленные фрагменты и не выдумывай факты или таймкоды. Сначала восстанови общий смысл по соседним репликам, а не пересказывай одну случайную фразу. Распознавание Whisper может содержать ошибки, обрывки, английские слова и бессмыслицу: не выдавай неразборчивый текст за осмысленную речь и не исправляй его догадками. Если смысл можно понять только частично, прямо обозначь неопределённость. Если спрашивают о начале/конце/середине, обобщи весь предоставленный временной отрезок, а не один фрагмент. Приводи 1–3 точных таймкода, только если они подтверждают ответ. Если подтверждений нет, так и скажи." },
+          { role: "user", content: `Вопрос: ${question}${scope ? `\\nВременной участок: ${scope.label} (${formatTime(scope.from)}–${formatTime(scope.to)}). Проанализируй его целиком.\\n` : ""}\\nФрагменты расшифровки по порядку:\\n${context}` }
         ]
       })
     });
