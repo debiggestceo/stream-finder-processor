@@ -28,6 +28,16 @@ function extractStreamUrl(text) {
   return ["kick", "twitch", "youtube"].includes(detectPlatform(url)) ? url : null;
 }
 
+async function cancelProcessorJob(env, jobId) {
+  try {
+    await fetch(PROCESSOR_URL + "/cancel-job", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Processor-Secret": env.PROCESSOR_SECRET },
+      body: JSON.stringify({ job_id: jobId })
+    });
+  } catch (error) { console.error("Processor cancel request failed:", error); }
+}
+
 async function dispatchChunk(env, job) {
   await env.DB.prepare(`
     UPDATE stream_job_state SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE job_id = ?
@@ -52,28 +62,31 @@ async function dispatchChunk(env, job) {
 }
 
 async function startJob(env, chatId, url) {
-  // Не запускаем одну и ту же запись дважды одновременно для одного чата.
-  // Это защищает от случайной повторной отправки ссылки и двойного расхода ресурсов.
-  const existing = await env.DB.prepare(`
-    SELECT s.job_id, j.next_chunk
-    FROM streams s
-    JOIN stream_job_state j ON j.job_id = s.job_id
-    WHERE s.chat_id = ?
-      AND s.url = ?
-      AND s.status = 'processing'
-      AND j.status IN ('processing', 'running')
-    ORDER BY s.id DESC
-    LIMIT 1
-  `).bind(String(chatId), url).first();
+  const active = await env.DB.prepare(`
+    SELECT job_id, next_chunk FROM stream_job_state
+    WHERE chat_id = ? AND status IN ('processing', 'running')
+    ORDER BY updated_at DESC LIMIT 1
+  `).bind(String(chatId)).first();
 
-  if (existing) {
-    const minute = Number(existing.next_chunk || 0) * 10;
-    await telegram(
-      env,
-      chatId,
-      `Эта запись уже обрабатывается. Повторно запускать её не буду, чтобы не тратить ресурсы. Сейчас обработано примерно до ${minute}-й минуты.`
-    );
-    return { status: "already_processing", job_id: existing.job_id };
+  if (active) {
+    const minute = Number(active.next_chunk || 0) * 10;
+    await telegram(env, chatId, `У тебя уже обрабатывается одна запись. Сейчас примерно до ${minute}-й минуты. Дождись завершения или отправь /cancel, чтобы отменить её.`);
+    return { status: "already_processing", job_id: active.job_id };
+  }
+
+  const recent = await env.DB.prepare(`
+    SELECT updated_at FROM stream_job_state
+    WHERE chat_id = ? ORDER BY updated_at DESC LIMIT 1
+  `).bind(String(chatId)).first();
+
+  if (recent?.updated_at) {
+    const lastMs = Date.parse(String(recent.updated_at).replace(" ", "T") + "Z");
+    const cooldownMs = 60 * 1000;
+    if (Number.isFinite(lastMs) && Date.now() - lastMs < cooldownMs) {
+      const left = Math.ceil((cooldownMs - (Date.now() - lastMs)) / 1000);
+      await telegram(env, chatId, `Подожди ${left} сек. перед запуском следующего видео.`);
+      return { status: "cooldown" };
+    }
   }
 
   const jobId = crypto.randomUUID();
@@ -112,6 +125,10 @@ async function processorChunk(request, env) {
 
   const job = await env.DB.prepare(`SELECT * FROM stream_job_state WHERE job_id = ?`).bind(jobId).first();
   if (!job) return Response.json({ error: "Job not found" }, { status: 404 });
+
+  if (job.status === "cancelled") {
+    return Response.json({ status: "cancelled", job_id: jobId });
+  }
 
   if (chunkIndex !== job.next_chunk) {
     return Response.json({ status: "ignored", expected_chunk: job.next_chunk });
@@ -330,6 +347,29 @@ async function handleQuestion(env, chatId, question) {
   }
 }
 
+async function cancelJob(env, chatId) {
+  const job = await env.DB.prepare(`
+    SELECT job_id, next_chunk FROM stream_job_state
+    WHERE chat_id = ? AND status IN ('processing', 'running')
+    ORDER BY updated_at DESC LIMIT 1
+  `).bind(String(chatId)).first();
+
+  if (!job) return telegram(env, chatId, "Сейчас у тебя нет активной обработки.");
+
+  await env.DB.prepare(`
+    UPDATE stream_job_state SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP, error = 'Cancelled by user'
+    WHERE job_id = ?
+  `).bind(job.job_id).run();
+
+  await env.DB.prepare(`
+    UPDATE streams SET status = 'cancelled', error = 'Cancelled by user'
+    WHERE job_id = ?
+  `).bind(job.job_id).run();
+
+  await cancelProcessorJob(env, job.job_id);
+  return telegram(env, chatId, `Обработку отменил. Остановился примерно на ${Number(job.next_chunk || 0) * 10}-й минуте.`);
+}
+
 async function handleTelegram(update, env) {
   const message = update.message;
   if (!message?.text || !message.chat?.id) return;
@@ -337,9 +377,11 @@ async function handleTelegram(update, env) {
   const chatId = message.chat.id;
   const text = message.text.trim();
 
+  if (text === "/cancel") return cancelJob(env, chatId);
+
   if (text === "/start" || text === "/help") {
     return telegram(env, chatId,
-      "Привет! Я Stream Finder.\n\nОтправь ссылку на запись Kick, Twitch или YouTube, и я расшифрую её.\n\nПосле обработки задавай вопросы по содержанию записи."
+      "Привет! Я Stream Finder.\n\nОтправь ссылку на запись Kick, Twitch или YouTube, и я расшифрую её.\n\nПосле обработки задавай вопросы по содержанию записи.\n\nВо время обработки нельзя запускать вторую запись. Для отмены используй /cancel."
     );
   }
 
