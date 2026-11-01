@@ -253,7 +253,7 @@ function detectTimeScope(question, segments) {
   const last = segments.reduce((max, s) => Math.max(max, timeToSeconds(s.end_time || s.start_time)), 0);
 
   // Exact HH:MM:SS queries should retrieve audio and visual evidence around that moment.
-  const timestamp = String(question || "").match(/(?:^|\\s)(\\d{1,2}):([0-5]\\d):([0-5]\\d)(?:$|\\s)/);
+  const timestamp = String(question || "").match(/(?:^|\s)(\d{1,2}):([0-5]\d):([0-5]\d)(?:$|\s)/);
   if (timestamp) {
     const target = Number(timestamp[1]) * 3600 + Number(timestamp[2]) * 60 + Number(timestamp[3]);
     const from = Math.max(0, target - 45);
