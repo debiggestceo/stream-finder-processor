@@ -594,6 +594,26 @@ export default {
       return Response.json({ status: "Stream Finder Worker online" });
     }
 
+    if (request.method === "GET" && url.pathname === "/health") {
+      try {
+        const health = await env.DB.prepare(`
+          SELECT checked_at, status, http_status, latency_ms,
+                 groq_configured, vision_enabled, error
+          FROM system_health WHERE id = 1
+        `).first();
+        return Response.json({
+          worker: "online",
+          processor: health || { status: "monitoring_not_started" }
+        }, { status: health?.status === "unhealthy" ? 503 : 200 });
+      } catch (error) {
+        console.error("Health endpoint failed:", error);
+        return Response.json({
+          worker: "online",
+          processor: { status: "monitoring_not_started" }
+        }, { status: 200 });
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/vision") {
       try {
         if (!env.PROCESSOR_SECRET || request.headers.get("x-stream-finder-secret") !== env.PROCESSOR_SECRET) {
