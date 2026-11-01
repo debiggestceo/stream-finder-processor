@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
 VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
@@ -296,34 +297,35 @@ def transcribe_chunk(audio_path, offset):
 
 
 def analyze_video_frames(source_path, offset, duration):
-    """Sample a few frames from the chunk and describe visible content with Groq vision."""
-    if not GROQ_API_KEY or not VISION_ENABLED:
+    """Sample frames and index only concrete, searchable visual facts."""
+    if not GEMINI_API_KEY or not VISION_ENABLED:
         return []
 
-    # Sample roughly every 30 seconds. This is dense enough to catch short clips
-    # while keeping the visual index compact (only useful markers are persisted).
-    sample_count = max(1, int(duration // 30))
-    positions = [min(duration - 1, i * 30 + 15) for i in range(sample_count)]
+    positions = [min(duration - 1, t) for t in range(30, max(31, int(duration)), 60)]
+    if not positions:
+        positions = [max(0, int(duration // 2))]
+
     results = []
-    # Groq free-tier vision requests are rate-limited. Pace requests and back off
-    # on 429 instead of wasting the whole visual pass.
-    vision_delay = 1
+    prompt = (
+        "Проанализируй кадр стрима. Ищи только конкретные проверяемые признаки, полезные "
+        "для последующего поиска: узнаваемого публичного человека, исполнителя, название "
+        "видео/канала/игры, крупный читаемый текст или важное действие. "
+        "Если ничего конкретного и уверенного нет — ответь ровно NONE. "
+        "Если есть — дай одну короткую точную поисковую метку. Не выдумывай."
+    )
 
     for local_time in positions:
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         frame_path = frame.name
         frame.close()
-
         try:
             command = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", str(local_time), "-i", source_path,
-                "-frames:v", "1", "-vf", "scale=640:-2",
-                "-q:v", "5", frame_path
+                "-frames:v", "1", "-vf", "scale=768:-2",
+                "-q:v", "4", frame_path
             ]
-            result = subprocess.run(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90
-            )
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
             if result.returncode != 0 or not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
                 continue
 
@@ -331,47 +333,39 @@ def analyze_video_frames(source_path, offset, duration):
             with open(frame_path, "rb") as image_file:
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
 
-            # Vision models do not accept arbitrary local URLs; send the sampled frame
-            # as a data URL. If the configured model/provider rejects vision, this is
-            # treated as a non-fatal enhancement failure.
-            payload = {
-                "model": VISION_MODEL,
-                "temperature": 0.1,
-                "max_tokens": 120,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Проверь кадр на конкретные узнаваемые объекты, полезные для поиска по стриму: "
-                                "известный человек, исполнитель, название видео/канала, игра, крупный читаемый текст "
-                                "или важное действие. Если такого конкретного признака нет или ты не уверен — ответь ровно: NONE. "
-                                "Если есть — дай ОДНУ очень короткую поисковую метку без описания кадра."
-                            )
-                        },
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}}
-                    ]
-                }]
-            }
             response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json=payload, timeout=120
+                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                    "Api-Revision": "2026-05-20"
+                },
+                json={
+                    "model": "gemini-3.8-flash",
+                    "input": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image", "data": encoded, "mime_type": "image/jpeg"}
+                    ]
+                },
+                timeout=120
             )
 
-            # Never let free-tier vision limits stall the whole VOD.
-            # If Groq asks us to wait a long time, skip this frame immediately.
-            if response.status_code == 429:
-                retry_after = response.headers.get("retry-after")
-                log.warning("Vision rate limited; skipping frame instead of waiting (retry-after=%s)", retry_after)
+            if response.status_code in (429, 503):
+                log.warning("Gemini vision temporarily unavailable; skipping frame (%s)", response.status_code)
                 continue
-
             response.raise_for_status()
-            description = response.json()["choices"][0]["message"]["content"].strip()
-            # Store only a compact searchable marker. Generic frame descriptions are
-            # deliberately discarded so the database does not fill up with visual noise.
-            if description and description.strip().upper() not in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
+
+            data = response.json()
+            description = (data.get("output_text") or "").strip()
+            if not description:
+                for step in data.get("steps", []):
+                    if step.get("type") == "model_output":
+                        for part in step.get("content", []):
+                            if part.get("type") == "text":
+                                description += part.get("text", "")
+            description = description.strip()
+
+            if description and description.upper() not in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
                 description = " ".join(description.split())[:180]
                 absolute_time = offset + local_time
                 results.append({
@@ -381,8 +375,7 @@ def analyze_video_frames(source_path, offset, duration):
                     "text": "[ВИДЕО-МЕТКА] " + description
                 })
         except Exception:
-            # Video understanding is an enhancement: a vision failure must not kill transcription.
-            log.exception("Vision analysis failed for frame")
+            log.exception("Gemini vision analysis failed for frame")
         finally:
             try:
                 if os.path.exists(frame_path):
@@ -390,11 +383,7 @@ def analyze_video_frames(source_path, offset, duration):
             except OSError:
                 pass
 
-        # Pace successful/failed frame requests to stay below provider request limits.
-        time.sleep(vision_delay)
-
     return results
-
 
 def send_callback(payload):
     if not PROCESSOR_SECRET:
