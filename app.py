@@ -26,7 +26,7 @@ VISION_FRAME_INTERVAL = 120
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 
-CHUNK_SECONDS = 1200  # 20-minute chunks reduce per-chunk startup/download overhead
+CHUNK_SECONDS = 600  # 10-minute chunks keep Kick muxed HLS downloads below the temp-file cap
 
 active_chunks = set()
 cancelled_jobs = set()
