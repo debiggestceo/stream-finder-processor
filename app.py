@@ -300,7 +300,11 @@ def transcribe_chunk(audio_path, offset):
 
 def analyze_video_frames(source_path, offset, duration):
     """Send sampled frames to our Cloudflare Worker, which runs Workers AI."""
-    if not VISION_ENABLED or not VISION_SHARED_SECRET:
+    if not VISION_ENABLED:
+        log.error("Vision analysis disabled by VISION_ENABLED=false")
+        return []
+    if not VISION_SHARED_SECRET:
+        log.error("Vision analysis disabled: PROCESSOR_SECRET is missing from Render")
         return []
 
     positions = [min(duration - 1, t) for t in range(0, max(1, int(duration)), VISION_FRAME_INTERVAL)]
@@ -308,7 +312,15 @@ def analyze_video_frames(source_path, offset, duration):
         positions = [max(0, int(duration // 2))]
 
     results = []
+    attempted = 0
+    extracted = 0
+    empty = 0
+    log.info(
+        "Vision analysis started: offset=%s duration=%.2f frames=%s interval=%ss",
+        format_time(offset), duration, len(positions), VISION_FRAME_INTERVAL
+    )
     for local_time in positions:
+        attempted += 1
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         frame_path = frame.name
         frame.close()
@@ -320,8 +332,17 @@ def analyze_video_frames(source_path, offset, duration):
                 "-q:v", "4", frame_path
             ]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-            if result.returncode != 0 or not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
+            if result.returncode != 0:
+                log.warning(
+                    "Vision frame extraction failed at %s: ffmpeg_exit=%s stderr=%s",
+                    format_time(offset + local_time), result.returncode,
+                    result.stderr.decode("utf-8", errors="replace")[:500]
+                )
                 continue
+            if not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
+                log.warning("Vision frame extraction produced an empty image at %s", format_time(offset + local_time))
+                continue
+            extracted += 1
 
             import base64
             with open(frame_path, "rb") as image_file:
@@ -350,8 +371,11 @@ def analyze_video_frames(source_path, offset, duration):
                 continue
             description = description.strip()
 
-            if description and description.upper() not in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
-                description = " ".join(description.split())[:180]
+            if not description or description.upper() in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
+                empty += 1
+                continue
+
+            description = " ".join(description.split())[:180]
                 absolute_time = offset + local_time
                 log.info("Vision recognized frame at %s: %s", format_time(absolute_time), description[:140])
                 results.append({
@@ -369,6 +393,10 @@ def analyze_video_frames(source_path, offset, duration):
             except OSError:
                 pass
 
+    log.info(
+        "Vision analysis finished: offset=%s attempted=%s extracted=%s empty=%s recognized=%s",
+        format_time(offset), attempted, extracted, empty, len(results)
+    )
     return results
 
 def send_callback(payload):
