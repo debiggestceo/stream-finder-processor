@@ -1,0 +1,96 @@
+name: Stream Finder Render Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: stream-finder-render-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Render service state and processor endpoint
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: srv-dbj3rsvf3r2c73esua60
+          PROCESSOR_URL: https://stream-finder-processor.onrender.com
+        run: |
+          set -euo pipefail
+
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "::error::RENDER_API_KEY repository secret is missing"
+            exit 1
+          fi
+
+          service_json="$(curl --fail --silent --show-error --retry 2 \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Accept: application/json" \
+            "https://api.render.com/v1/services/$RENDER_SERVICE_ID")"
+
+          suspended="$(printf '%s' "$service_json" | jq -r '.suspended // "unknown"')"
+          echo "Render service suspended state: $suspended"
+          if [ "$suspended" != "not_suspended" ]; then
+            echo "::error::Render service is not in the expected active state ($suspended)"
+            exit 1
+          fi
+
+          body="$(curl --fail --silent --show-error --retry 2 --max-time 35 "$PROCESSOR_URL/")"
+          if ! printf '%s' "$body" | grep -q "Stream Finder Processor is online"; then
+            echo "::error::Processor root endpoint did not return the expected health marker"
+            exit 1
+          fi
+
+          echo "Render service metadata and processor endpoint are healthy."
+
+  report-failure:
+    if: failure()
+    needs: monitor
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or update monitoring issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "Stream Finder Render monitor detected a problem";
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              "The scheduled Render monitor could not verify the Stream Finder processor.",
+              "",
+              `Workflow run: ${runUrl}`,
+              `Commit: ${context.sha}`,
+              "",
+              "Open the workflow run and inspect the failed step. This monitor does not restart services or change production code."
+            ].join("\n");
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100
+            });
+            const issue = existing.data.find(item => item.title === title && !item.pull_request);
+            if (issue) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body
+              });
+            }
