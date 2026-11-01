@@ -299,9 +299,10 @@ def analyze_video_frames(source_path, offset, duration):
     if not GROQ_API_KEY or not VISION_ENABLED:
         return []
 
-    # Three representative frames per 10-minute chunk keeps processing lightweight.
-    sample_count = 3 if duration >= 60 else 1
-    positions = [duration * (i + 1) / (sample_count + 1) for i in range(sample_count)]
+    # Sample roughly every 30 seconds. This is dense enough to catch short clips
+    # while keeping the visual index compact (only useful markers are persisted).
+    sample_count = max(1, int(duration // 30))
+    positions = [min(duration - 1, i * 30 + 15) for i in range(sample_count)]
     results = []
 
     for local_time in positions:
