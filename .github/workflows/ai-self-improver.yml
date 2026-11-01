@@ -68,5 +68,3 @@ jobs:
             - Production is not changed by this workflow.
             - Deployment and infrastructure files are outside the agent's allowlist.
             - No automatic merge is enabled.
-          labels: |
-            ai-proposal
