@@ -19,7 +19,6 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 VISION_SHARED_SECRET = os.getenv("PROCESSOR_SECRET")
 VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
 VISION_MODEL = os.getenv("VISION_MODEL", "@cf/qwen/qwen3.8-27b")
@@ -299,36 +298,6 @@ def transcribe_chunk(audio_path, offset):
             time.sleep(3 * (attempt + 1))
 
 
-def analyze_frame_gemini(image_base64):
-    """Use the existing Gemini key; stop rather than risk paid fallback on quota limits."""
-    if not GEMINI_API_KEY:
-        return None, "not_configured"
-    model = os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash")
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    payload = {"contents": [{"parts": [
-        {"text": VISION_PROMPT},
-        {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
-    ]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 160}}
-    try:
-        response = requests.post(endpoint, headers={
-            "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"
-        }, json=payload, timeout=90)
-        if response.status_code in (403, 429):
-            log.warning("Gemini quota/access limit reached (HTTP %s); stopping visual scan. No paid fallback.", response.status_code)
-            return None, "quota"
-        response.raise_for_status()
-        data = response.json()
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        answer = " ".join(p.get("text", "") for p in parts if isinstance(p, dict))
-        return answer.strip() or "NONE", "ok"
-    except requests.RequestException as error:
-        log.warning("Gemini request failed: %s", str(error)[:300])
-        return None, "error"
-    except (ValueError, KeyError, IndexError, TypeError) as error:
-        log.warning("Gemini response parse failed: %s", str(error)[:200])
-        return None, "error"
-
-
 VISION_PROMPT = (
     "Ты анализируешь отдельный кадр записи стрима. Определи, что видно на экране: "
     "игра, видео в браузере/плеере, сайт, человек или приложение. Для игр используй "
@@ -339,8 +308,56 @@ VISION_PROMPT = (
 )
 
 
+def analyze_frame_groq(image_base64):
+    """Analyze one frame with Groq's free-plan vision model using the existing Groq key."""
+    if not GROQ_API_KEY:
+        return None, "not_configured"
+    model = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+    endpoint = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": VISION_PROMPT},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64," + image_base64
+                }}
+            ]
+        }],
+        "temperature": 0.1,
+        "max_completion_tokens": 160
+    }
+    try:
+        response = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=90
+        )
+        if response.status_code == 429:
+            log.warning("Groq vision free quota/rate limit reached; stopping scan. No paid fallback.")
+            return None, "quota"
+        if response.status_code in (401, 403):
+            log.error("Groq vision authorization/access error (HTTP %s)", response.status_code)
+            return None, "configuration"
+        response.raise_for_status()
+        data = response.json()
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(answer, list):
+            answer = " ".join(p.get("text", "") for p in answer if isinstance(p, dict))
+        return (answer.strip() if isinstance(answer, str) else "") or "NONE", "ok"
+    except requests.RequestException as error:
+        log.warning("Groq vision request failed: %s", str(error)[:300])
+        return None, "error"
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        log.warning("Groq vision response parse failed: %s", str(error)[:200])
+        return None, "error"
+
+
 def analyze_video_frames(source_path, offset, duration):
-    """Gemini is primary; existing Cloudflare Workers AI is fallback only for transport errors."""
+    """Use Groq vision first, with Cloudflare as a free fallback only for transient errors."""
     if not VISION_ENABLED:
         log.error("Vision analysis disabled by VISION_ENABLED=false")
         return []
@@ -351,7 +368,7 @@ def analyze_video_frames(source_path, offset, duration):
     positions = [min(duration - 1, t) for t in range(0, max(1, int(duration)), VISION_FRAME_INTERVAL)]
     results = []
     attempted = extracted = empty = 0
-    provider = "Gemini" if GEMINI_API_KEY else "Cloudflare"
+    provider = "Groq" if GROQ_API_KEY else "Cloudflare"
     log.info("Vision started: provider=%s offset=%s frames=%s interval=%ss",
              provider, format_time(offset), len(positions), VISION_FRAME_INTERVAL)
 
@@ -373,13 +390,14 @@ def analyze_video_frames(source_path, offset, duration):
             with open(frame_path, "rb") as image_file:
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
 
-            description, gemini_status = (None, "not_configured")
-            if GEMINI_API_KEY:
-                description, gemini_status = analyze_frame_gemini(encoded)
-                if gemini_status == "quota":
+            description, groq_status = (None, "not_configured")
+            if GROQ_API_KEY:
+                description, groq_status = analyze_frame_groq(encoded)
+                if groq_status == "quota":
                     break
 
-            if description is None and gemini_status != "quota":
+            # Cloudflare is only a free fallback for temporary/provider errors.
+            if description is None and groq_status not in ("quota", "configuration"):
                 response = requests.post(
                     WORKER_URL + "/vision",
                     headers={"Content-Type": "application/json",
@@ -416,8 +434,9 @@ def analyze_video_frames(source_path, offset, duration):
             except OSError:
                 pass
 
-    log.info("Vision finished: provider=%s offset=%s attempted=%s extracted=%s empty=%s recognized=%s",
-             provider, format_time(offset), attempted, extracted, empty, len(results))
+    log.info("Vision finished: provider=%s model=%s offset=%s attempted=%s extracted=%s empty=%s recognized=%s",
+             provider, os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b"),
+             format_time(offset), attempted, extracted, empty, len(results))
     return results
 
 def send_callback(payload):
@@ -559,8 +578,8 @@ def health():
         "groq_configured": bool(GROQ_API_KEY),
         "vision_enabled": bool(VISION_SHARED_SECRET) and VISION_ENABLED,
         "vision_frame_interval_seconds": VISION_FRAME_INTERVAL,
-        "vision_model": os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash") if GEMINI_API_KEY else VISION_MODEL,
-        "gemini_configured": bool(GEMINI_API_KEY),
+        "vision_provider": "groq" if GROQ_API_KEY else "cloudflare",
+        "vision_model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b") if GROQ_API_KEY else VISION_MODEL,
         "processor_secret_configured": bool(PROCESSOR_SECRET),
         "platforms": ["Kick", "Twitch", "YouTube"]
     })
