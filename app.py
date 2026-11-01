@@ -326,6 +326,9 @@ def analyze_video_frames(source_path, offset, duration):
             with open(frame_path, "rb") as image_file:
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
 
+            # Vision models do not accept arbitrary local URLs; send the sampled frame
+            # as a data URL. If the configured model/provider rejects vision, this is
+            # treated as a non-fatal enhancement failure.
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
