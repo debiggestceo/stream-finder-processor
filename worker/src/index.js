@@ -274,9 +274,29 @@ function detectTimeScope(question, segments) {
   return null;
 }
 
+function timestampLink(rawUrl, seconds) {
+  try {
+    const url = new URL(rawUrl);
+    const total = Math.max(0, Math.floor(seconds));
+    if (url.hostname === "kick.com" || url.hostname.endsWith(".kick.com")) {
+      url.searchParams.set("t", total + "s");
+    } else if (url.hostname === "twitch.tv" || url.hostname.endsWith(".twitch.tv")) {
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      url.searchParams.set("t", (h ? h + "h" : "") + (m ? m + "m" : "") + s + "s");
+    } else {
+      url.searchParams.set("t", String(total));
+    }
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 async function handleQuestion(env, chatId, question) {
   const stream = await env.DB.prepare(`
-    SELECT job_id, status FROM streams WHERE chat_id = ? ORDER BY id DESC LIMIT 1
+    SELECT job_id, status, url FROM streams WHERE chat_id = ? ORDER BY id DESC LIMIT 1
   `).bind(String(chatId)).first();
 
   if (!stream) return telegram(env, chatId, "Сначала отправь ссылку на запись Kick, Twitch или YouTube.");
@@ -291,12 +311,14 @@ async function handleQuestion(env, chatId, question) {
 
   const scope = detectTimeScope(question, segments);
   let selected = [];
+  let moments = [];
 
   if (scope) {
     selected = segments.filter(s => {
       const t = timeToSeconds(s.start_time);
       return t >= scope.from && t <= scope.to;
     }).slice(0, 60);
+    moments = selected.filter(s => String(s.transcript || "").trim()).slice(0, 5);
   } else {
     const terms = await expandSearchTerms(env, question);
     const normalizedTerms = terms.map(normalizeText).filter(Boolean);
@@ -325,6 +347,7 @@ async function handleQuestion(env, chatId, question) {
     // имени: expandSearchTerms уже добавляет варианты, прозвища и связанные поисковые
     // фразы. Но модели явно запрещено считать совпадение доказательством, пока она не
     // увидит во фрагменте узнаваемый контент.
+    moments = ranked.slice(0, 5);
     const indexes = new Set();
     for (const hit of ranked) {
       for (let i = Math.max(0, hit.index - 2); i <= Math.min(segments.length - 1, hit.index + 2); i++) indexes.add(i);
@@ -387,7 +410,14 @@ async function handleQuestion(env, chatId, question) {
     });
     if (!response.ok) throw new Error(await response.text());
     const result = await response.json();
-    return telegram(env, chatId, result.choices?.[0]?.message?.content || "Не удалось сформировать ответ.");
+    const answer = result.choices?.[0]?.message?.content || "Не удалось сформировать ответ.";
+    const links = moments.slice(0, 5).map(segment => {
+      const seconds = timeToSeconds(segment.start_time);
+      const quote = String(segment.transcript || "").replace(/\\s+/g, " ").trim().slice(0, 120);
+      return `• [${segment.start_time}] ${quote}\\n${timestampLink(stream.url, seconds)}`;
+    });
+    const momentBlock = links.length ? "\\n\\n🎯 Найденные моменты (по распознанной речи):\\n" + links.join("\\n") : "";
+    return telegram(env, chatId, answer + momentBlock);
   } catch (error) {
     console.error("Groq answer error:", error);
     return telegram(env, chatId, "Не удалось обработать вопрос. Попробуй ещё раз.");
