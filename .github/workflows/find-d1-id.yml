@@ -1,0 +1,29 @@
+name: Find Cloudflare D1 Database ID
+
+on:
+  workflow_dispatch:
+
+jobs:
+  find-d1:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find stream-finder-db
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: 5044910b66f0e2cc97afc98929876130
+        run: |
+          set -e
+          RESPONSE=$(curl -sS -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+          echo "$RESPONSE" > response.json
+          cat response.json | jq '.result[] | select(.name=="stream-finder-db") | {uuid,name}'
+          UUID=$(cat response.json | jq -r '.result[] | select(.name=="stream-finder-db") | .uuid')
+          if [ -z "$UUID" ] || [ "$UUID" = "null" ]; then
+            echo "Database stream-finder-db not found" >&2
+            exit 1
+          fi
+          echo "### D1 database found" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Name: stream-finder-db" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Database ID: $UUID" >> "$GITHUB_STEP_SUMMARY"
+          echo "D1_DATABASE_ID=$UUID" >> "$GITHUB_ENV"
