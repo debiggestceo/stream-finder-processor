@@ -146,7 +146,7 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
 
     options = {
         # Audio-only download: avoids video bandwidth and all vision-model quota usage.
-        "format": "bestaudio/best",
+        "format": "bestaudio",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -172,7 +172,21 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
 
         with download_slots:
             with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.extract_info(video_url, download=True)
+                info = ydl.extract_info(video_url, download=True)
+
+        # Do not silently fall back to combined audio/video formats.
+        requested = (info or {}).get("requested_downloads") or []
+        selected = requested[0] if requested else info or {}
+        audio_codec = selected.get("acodec")
+        video_codec = selected.get("vcodec")
+        log.info(
+            "Selected download format: job=%s chunk=%s format_id=%s acodec=%s vcodec=%s",
+            job_id, chunk_index, selected.get("format_id"), audio_codec, video_codec
+        )
+        if audio_codec in (None, "none") or video_codec not in (None, "none"):
+            raise RuntimeError(
+                "Источник не предоставил отдельный аудиопоток; загрузка видео запрещена"
+            )
 
         candidates = []
         for name in os.listdir(folder):
