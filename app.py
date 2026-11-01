@@ -20,7 +20,7 @@ log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-VISION_SHARED_SECRET = os.getenv("VISION_SHARED_SECRET")
+VISION_SHARED_SECRET = os.getenv("PROCESSOR_SECRET")
 VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
 VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
