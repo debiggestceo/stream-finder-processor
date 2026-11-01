@@ -251,6 +251,16 @@ function timeToSeconds(value) {
 function detectTimeScope(question, segments) {
   const q = normalizeText(question);
   const last = segments.reduce((max, s) => Math.max(max, timeToSeconds(s.end_time || s.start_time)), 0);
+
+  // Exact HH:MM:SS queries should retrieve audio and visual evidence around that moment.
+  const timestamp = String(question || "").match(/(?:^|\\s)(\\d{1,2}):([0-5]\\d):([0-5]\\d)(?:$|\\s)/);
+  if (timestamp) {
+    const target = Number(timestamp[1]) * 3600 + Number(timestamp[2]) * 60 + Number(timestamp[3]);
+    const from = Math.max(0, target - 45);
+    const to = Math.min(last || target + 45, target + 45);
+    return { label: `около ${formatTime(target)}`, from, to };
+  }
+
   if (/(начал|с самого начала|первые минуты|первую минут|в начале|начало видео|начало стрима)/.test(q)) {
     return { label: "начало записи", from: 0, to: Math.min(180, last || 180) };
   }
