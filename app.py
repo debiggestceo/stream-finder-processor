@@ -20,6 +20,7 @@ log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+VISION_SHARED_SECRET = os.getenv("VISION_SHARED_SECRET")
 VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
 VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
@@ -297,8 +298,8 @@ def transcribe_chunk(audio_path, offset):
 
 
 def analyze_video_frames(source_path, offset, duration):
-    """Sample frames and index only concrete, searchable visual facts."""
-    if not GEMINI_API_KEY or not VISION_ENABLED:
+    """Send sampled frames to our Cloudflare Worker, which runs Workers AI."""
+    if not VISION_ENABLED or not VISION_SHARED_SECRET:
         return []
 
     positions = [min(duration - 1, t) for t in range(30, max(31, int(duration)), 60)]
@@ -306,14 +307,6 @@ def analyze_video_frames(source_path, offset, duration):
         positions = [max(0, int(duration // 2))]
 
     results = []
-    prompt = (
-        "Проанализируй кадр стрима. Ищи только конкретные проверяемые признаки, полезные "
-        "для последующего поиска: узнаваемого публичного человека, исполнителя, название "
-        "видео/канала/игры, крупный читаемый текст или важное действие. "
-        "Если ничего конкретного и уверенного нет — ответь ровно NONE. "
-        "Если есть — дай одну короткую точную поисковую метку. Не выдумывай."
-    )
-
     for local_time in positions:
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         frame_path = frame.name
@@ -334,36 +327,20 @@ def analyze_video_frames(source_path, offset, duration):
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
 
             response = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                WORKER_URL + "/vision",
                 headers={
-                    "x-goog-api-key": GEMINI_API_KEY,
                     "Content-Type": "application/json",
-                    "Api-Revision": "2026-05-20"
+                    "x-stream-finder-secret": VISION_SHARED_SECRET
                 },
-                json={
-                    "model": "gemini-3.8-flash",
-                    "input": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image", "data": encoded, "mime_type": "image/jpeg"}
-                    ]
-                },
+                json={"image": encoded},
                 timeout=120
             )
 
             if response.status_code in (429, 503):
-                log.warning("Gemini vision temporarily unavailable; skipping frame (%s)", response.status_code)
+                log.warning("Cloudflare Workers AI temporarily limited; skipping frame (%s)", response.status_code)
                 continue
             response.raise_for_status()
-
-            data = response.json()
-            description = (data.get("output_text") or "").strip()
-            if not description:
-                for step in data.get("steps", []):
-                    if step.get("type") == "model_output":
-                        for part in step.get("content", []):
-                            if part.get("type") == "text":
-                                description += part.get("text", "")
-            description = description.strip()
+            description = (response.json().get("result") or "").strip()
 
             if description and description.upper() not in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
                 description = " ".join(description.split())[:180]
@@ -375,7 +352,7 @@ def analyze_video_frames(source_path, offset, duration):
                     "text": "[ВИДЕО-МЕТКА] " + description
                 })
         except Exception:
-            log.exception("Gemini vision analysis failed for frame")
+            log.exception("Cloudflare vision analysis failed for frame")
         finally:
             try:
                 if os.path.exists(frame_path):
