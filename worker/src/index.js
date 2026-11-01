@@ -502,6 +502,90 @@ async function recoverJobs(env) {
   }
 }
 
+async function checkProcessorHealth(env) {
+  const checkedAt = new Date().toISOString();
+  let status = "unhealthy";
+  let httpStatus = null;
+  let latencyMs = null;
+  let groqConfigured = 0;
+  let visionEnabled = 0;
+  let errorText = null;
+
+  try {
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    let response;
+    try {
+      response = await fetch(PROCESSOR_URL + "/", {
+        method: "GET",
+        headers: { "Cache-Control": "no-cache" },
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    httpStatus = response.status;
+    latencyMs = Date.now() - startedAt;
+    if (!response.ok) throw new Error("Processor health HTTP " + response.status);
+
+    const health = await response.json();
+    if (health.status !== "Stream Finder Processor is online") {
+      throw new Error("Unexpected processor health payload");
+    }
+
+    groqConfigured = health.groq_configured === true ? 1 : 0;
+    visionEnabled = health.vision_enabled === true ? 1 : 0;
+    status = groqConfigured && visionEnabled ? "healthy" : "degraded";
+  } catch (error) {
+    errorText = String(error?.message || error).slice(0, 500);
+  }
+
+  try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS system_health (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        checked_at TEXT NOT NULL,
+        status TEXT NOT NULL,
+        http_status INTEGER,
+        latency_ms INTEGER,
+        groq_configured INTEGER NOT NULL DEFAULT 0,
+        vision_enabled INTEGER NOT NULL DEFAULT 0,
+        error TEXT
+      )
+    `).run();
+
+    await env.DB.prepare(`
+      INSERT INTO system_health
+        (id, checked_at, status, http_status, latency_ms, groq_configured, vision_enabled, error)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        checked_at = excluded.checked_at,
+        status = excluded.status,
+        http_status = excluded.http_status,
+        latency_ms = excluded.latency_ms,
+        groq_configured = excluded.groq_configured,
+        vision_enabled = excluded.vision_enabled,
+        error = excluded.error
+    `).bind(checkedAt, status, httpStatus, latencyMs, groqConfigured, visionEnabled, errorText).run();
+  } catch (dbError) {
+    console.error("Could not persist processor health:", dbError);
+  }
+
+  if (status === "healthy") {
+    console.log("Processor health: healthy; latency_ms=" + latencyMs);
+  } else {
+    console.error("Processor health: " + status, {
+      http_status: httpStatus,
+      latency_ms: latencyMs,
+      groq_configured: Boolean(groqConfigured),
+      vision_enabled: Boolean(visionEnabled),
+      error: errorText
+    });
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -546,6 +630,11 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(recoverJobs(env));
+    // Runs every minute via the existing Cloudflare Cron Trigger.
+    // Keep the processor warm, persist its health, and recover stale jobs.
+    ctx.waitUntil(Promise.allSettled([
+      recoverJobs(env),
+      checkProcessorHealth(env)
+    ]));
   }
 };
