@@ -14,3 +14,7 @@ queue = "stream-jobs"
 
 [triggers]
 crons = ["* * * * *"]
+
+
+[ai]
+binding = "AI"
