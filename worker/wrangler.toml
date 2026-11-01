@@ -1,0 +1,4 @@
+name = "stream-finder-bot"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+account_id = "5044910b66f0e2cc97afc98929876130"
