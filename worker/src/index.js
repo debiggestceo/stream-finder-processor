@@ -640,6 +640,33 @@ export default {
       }
     }
 
+    if (request.method === "POST" && url.pathname === "/transcribe") {
+      try {
+        if (!env.PROCESSOR_SECRET || request.headers.get("x-stream-finder-secret") !== env.PROCESSOR_SECRET) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        const body = await request.json();
+        if (!body?.audio || typeof body.audio !== "string") {
+          return Response.json({ error: "audio base64 is required" }, { status: 400 });
+        }
+        // Keep payloads bounded; processor sends one compressed 10-minute audio chunk.
+        if (body.audio.length > 12_000_000) {
+          return Response.json({ error: "audio payload too large" }, { status: 413 });
+        }
+        const result = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+          audio: body.audio,
+          task: "transcribe",
+          language: "ru"
+        });
+        return Response.json(result);
+      } catch (error) {
+        console.error("Workers AI transcription error:", error);
+        const message = String(error?.message || error);
+        const quota = message.includes("4006") || /daily free allocation|quota|rate.?limit/i.test(message);
+        return Response.json({ error: message }, { status: quota ? 429 : 500 });
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/vision") {
       try {
         if (!env.PROCESSOR_SECRET || request.headers.get("x-stream-finder-secret") !== env.PROCESSOR_SECRET) {
