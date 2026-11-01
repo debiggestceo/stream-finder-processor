@@ -13,7 +13,7 @@ binding = "STREAM_JOBS"
 queue = "stream-jobs"
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/5 * * * *"]
 
 
 [ai]
