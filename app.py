@@ -345,9 +345,10 @@ def analyze_video_frames(source_path, offset, duration):
                             {
                                 "type": "text",
                                 "text": (
-                                    "Кратко опиши только то, что видно на кадре стрима. "
-                                    "Укажи людей, игру, видео, интерфейс, текст или известного человека, "
-                                    "если это действительно можно определить. Не выдумывай."
+                                    "Проверь кадр на конкретные узнаваемые объекты, полезные для поиска по стриму: "
+                                    "известный человек, исполнитель, название видео/канала, игра, крупный читаемый текст "
+                                    "или важное действие. Если такого конкретного признака нет или ты не уверен — ответь ровно: NONE. "
+                                    "Если есть — дай ОДНУ очень короткую поисковую метку без описания кадра. Не пересказывай интерфейс и не выдумывай."
                                 )
                             },
                             {
@@ -361,13 +362,16 @@ def analyze_video_frames(source_path, offset, duration):
             )
             response.raise_for_status()
             description = response.json()["choices"][0]["message"]["content"].strip()
-            if description:
+            # Store only a compact searchable marker. Generic frame descriptions are
+            # deliberately discarded so the database does not fill up with visual noise.
+            if description and description.strip().upper() not in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
+                description = " ".join(description.split())[:180]
                 absolute_time = offset + local_time
                 results.append({
                     "start": absolute_time,
                     "end": absolute_time,
                     "time": format_time(absolute_time),
-                    "text": "[ВИДЕО] " + description
+                    "text": "[ВИДЕО-МЕТКА] " + description
                 })
         except Exception:
             # Video understanding is an enhancement: a vision failure must not kill transcription.
