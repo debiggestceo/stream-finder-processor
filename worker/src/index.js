@@ -487,7 +487,7 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/vision") {
       try {
-        if (!env.VISION_SHARED_SECRET || request.headers.get("x-stream-finder-secret") !== env.VISION_SHARED_SECRET) {
+        if (!env.PROCESSOR_SECRET || request.headers.get("x-stream-finder-secret") !== env.PROCESSOR_SECRET) {
           return new Response("Unauthorized", { status: 401 });
         }
         const body = await request.json();
