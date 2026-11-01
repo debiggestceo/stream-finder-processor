@@ -19,6 +19,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stream-finder")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
+VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 
@@ -292,6 +294,91 @@ def transcribe_chunk(audio_path, offset):
             time.sleep(3 * (attempt + 1))
 
 
+def analyze_video_frames(source_path, offset, duration):
+    """Sample a few frames from the chunk and describe visible content with Groq vision."""
+    if not GROQ_API_KEY or not VISION_ENABLED:
+        return []
+
+    # Three representative frames per 10-minute chunk keeps processing lightweight.
+    sample_count = 3 if duration >= 60 else 1
+    positions = [duration * (i + 1) / (sample_count + 1) for i in range(sample_count)]
+    results = []
+
+    for local_time in positions:
+        frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        frame_path = frame.name
+        frame.close()
+
+        try:
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", str(local_time), "-i", source_path,
+                "-frames:v", "1", "-vf", "scale=640:-2",
+                "-q:v", "5", frame_path
+            ]
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90
+            )
+            if result.returncode != 0 or not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
+                continue
+
+            import base64
+            with open(frame_path, "rb") as image_file:
+                encoded = base64.b64encode(image_file.read()).decode("ascii")
+
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": VISION_MODEL,
+                    "temperature": 0.1,
+                    "max_tokens": 300,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Кратко опиши только то, что видно на кадре стрима. "
+                                    "Укажи людей, игру, видео, интерфейс, текст или известного человека, "
+                                    "если это действительно можно определить. Не выдумывай."
+                                )
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/jpeg;base64," + encoded}
+                            }
+                        ]
+                    }]
+                },
+                timeout=120
+            )
+            response.raise_for_status()
+            description = response.json()["choices"][0]["message"]["content"].strip()
+            if description:
+                absolute_time = offset + local_time
+                results.append({
+                    "start": absolute_time,
+                    "end": absolute_time,
+                    "time": format_time(absolute_time),
+                    "text": "[ВИДЕО] " + description
+                })
+        except Exception:
+            # Video understanding is an enhancement: a vision failure must not kill transcription.
+            log.exception("Vision analysis failed for frame")
+        finally:
+            try:
+                if os.path.exists(frame_path):
+                    os.remove(frame_path)
+            except OSError:
+                pass
+
+    return results
+
+
 def send_callback(payload):
     if not PROCESSOR_SECRET:
         raise RuntimeError("PROCESSOR_SECRET не настроен")
@@ -365,11 +452,17 @@ def process_chunk_job(job_id, chat_id, video_url, chunk_index):
         audio_path = extract_audio_chunk(source_path, 0, chunk_duration)
         segments = transcribe_chunk(audio_path, offset)
 
+        # Visual analysis runs on the downloaded chunk before it is deleted.
+        video_segments = analyze_video_frames(source_path, offset, chunk_duration)
+        segments.extend(video_segments)
+        segments.sort(key=lambda item: float(item.get("start", 0)))
+
         log.info(
-            "Chunk completed: job=%s chunk=%s segments=%s",
+            "Chunk completed: job=%s chunk=%s audio_segments=%s video_segments=%s",
             job_id,
             chunk_index,
-            len(segments)
+            len(segments) - len(video_segments),
+            len(video_segments)
         )
 
         send_callback({
@@ -403,6 +496,8 @@ def health():
     return jsonify({
         "status": "Stream Finder Processor is online",
         "groq_configured": bool(GROQ_API_KEY),
+        "vision_enabled": bool(GROQ_API_KEY) and VISION_ENABLED,
+        "vision_model": VISION_MODEL,
         "processor_secret_configured": bool(PROCESSOR_SECRET),
         "platforms": ["Kick", "Twitch", "YouTube"]
     })
