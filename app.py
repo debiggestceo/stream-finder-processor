@@ -129,6 +129,7 @@ def get_video_info(job_id, video_url):
 
 def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
     folder = tempfile.mkdtemp(prefix=f"stream_{job_id}_{chunk_index}_")
+    platform = detect_platform(video_url)
 
     def guard_temp_size(_status):
         total = 0
@@ -141,12 +142,15 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
             return
         if total > MAX_TEMP_BYTES:
             raise RuntimeError(
-                "Загрузка фрагмента остановлена: временный файл превысил безопасный лимит 1.5 ГБ"
+                "Загрузка фрагмента остановлена: временный файл превысил безопасный лимит 600 МБ"
             )
 
+    # Kick VOD HLS currently exposes muxed audio+video variants rather than a
+    # separate audio-only rendition. Download the selected HLS range, extract
+    # MP3 immediately with FFmpeg, and let yt-dlp remove the temporary source.
+    # Twitch/YouTube continue to require a genuinely audio-only rendition.
     options = {
-        # Audio-only download: avoids video bandwidth and all vision-model quota usage.
-        "format": "bestaudio",
+        "format": "best" if platform == "Kick" else "bestaudio",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -159,31 +163,36 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
         "continuedl": True,
         "nopart": True,
         "overwrites": False,
-        # yt-dlp downloads only this VOD interval instead of the complete recording.
         "download_ranges": download_range_func(None, [(offset, offset + duration)]),
         "progress_hooks": [guard_temp_size],
     }
+    if platform == "Kick":
+        options["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "64",
+        }]
+        options["keepvideo"] = False
 
     try:
         log.info(
-            "Downloading ranged chunk: job=%s chunk=%s range=%s-%s",
-            job_id, chunk_index, format_time(offset), format_time(offset + duration)
+            "Downloading ranged audio job=%s platform=%s chunk=%s range=%s-%s",
+            job_id, platform, chunk_index, format_time(offset), format_time(offset + duration)
         )
 
         with download_slots:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(video_url, download=True)
 
-        # Do not silently fall back to combined audio/video formats.
         requested = (info or {}).get("requested_downloads") or []
         selected = requested[0] if requested else info or {}
         audio_codec = selected.get("acodec")
         video_codec = selected.get("vcodec")
         log.info(
-            "Selected download format: job=%s chunk=%s format_id=%s acodec=%s vcodec=%s",
+            "Selected source format: job=%s chunk=%s format_id=%s acodec=%s vcodec=%s",
             job_id, chunk_index, selected.get("format_id"), audio_codec, video_codec
         )
-        if audio_codec in (None, "none") or video_codec not in (None, "none"):
+        if platform != "Kick" and (audio_codec in (None, "none") or video_codec not in (None, "none")):
             raise RuntimeError(
                 "Источник не предоставил отдельный аудиопоток; загрузка видео запрещена"
             )
@@ -192,19 +201,23 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
         for name in os.listdir(folder):
             path = os.path.join(folder, name)
             if os.path.isfile(path) and not name.endswith((".part", ".ytdl")):
+                # Kick's muxed HLS source must never be passed downstream:
+                # only the extracted MP3 is accepted.
+                if platform == "Kick" and not name.lower().endswith(".mp3"):
+                    continue
                 candidates.append(path)
 
         if not candidates:
-            raise RuntimeError("yt-dlp не создал файл для выбранного фрагмента")
+            raise RuntimeError("Не найден готовый аудиофайл после загрузки/извлечения")
 
         filepath = max(candidates, key=os.path.getsize)
         size = os.path.getsize(filepath)
         if size < 1000:
-            raise RuntimeError("Загруженный фрагмент пустой или повреждён")
+            raise RuntimeError("Загруженный аудиофрагмент пустой или повреждён")
 
         log.info(
-            "Ranged chunk downloaded: job=%s chunk=%s size=%s",
-            job_id, chunk_index, size
+            "Audio chunk ready: job=%s chunk=%s size=%s format=%s",
+            job_id, chunk_index, size, os.path.splitext(filepath)[1]
         )
         return folder, filepath
 
