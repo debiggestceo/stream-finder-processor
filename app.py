@@ -307,7 +307,7 @@ def analyze_video_frames(source_path, offset, duration):
     results = []
     # Groq free-tier vision requests are rate-limited. Pace requests and back off
     # on 429 instead of wasting the whole visual pass.
-    vision_delay = 3
+    vision_delay = 1
 
     for local_time in positions:
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -354,22 +354,19 @@ def analyze_video_frames(source_path, offset, duration):
                     ]
                 }]
             }
-            response = None
-            for attempt in range(4):
-                response = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json=payload, timeout=120
-                )
-                if response.status_code != 429:
-                    break
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json=payload, timeout=120
+            )
+
+            # Never let free-tier vision limits stall the whole VOD.
+            # If Groq asks us to wait a long time, skip this frame immediately.
+            if response.status_code == 429:
                 retry_after = response.headers.get("retry-after")
-                try:
-                    wait = float(retry_after) if retry_after else min(30, 5 * (2 ** attempt))
-                except ValueError:
-                    wait = min(30, 5 * (2 ** attempt))
-                log.warning("Vision rate limited; waiting %.1fs before retry", wait)
-                time.sleep(wait)
+                log.warning("Vision rate limited; skipping frame instead of waiting (retry-after=%s)", retry_after)
+                continue
+
             response.raise_for_status()
             description = response.json()["choices"][0]["message"]["content"].strip()
             # Store only a compact searchable marker. Generic frame descriptions are
