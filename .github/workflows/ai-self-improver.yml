@@ -30,19 +30,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check whether AI is configured
+      - name: Check whether AI is explicitly enabled
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ENABLE_AI_IMPROVER: ${{ vars.ENABLE_AI_IMPROVER }}
         run: |
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::notice::OPENAI_API_KEY repository secret is missing. The scheduled job will not call the AI until it is configured."
-            echo "Add the OPENAI_API_KEY secret in repository Settings > Secrets and variables > Actions." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${ENABLE_AI_IMPROVER:-}" != "true" ]; then
+            echo "::notice::AI calls are disabled to avoid OpenAI API charges. Free checks will continue every 15 minutes."
+            echo "AI improvement calls are disabled. Set ENABLE_AI_IMPROVER=true only if you choose to pay for API usage." >> "$GITHUB_STEP_SUMMARY"
+          elif [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::notice::OPENAI_API_KEY is missing; AI calls are skipped."
           fi
 
       - name: Install existing project dependencies
         run: pip install -r requirements.txt
 
       - name: Ask AI for one bounded improvement
+        if: vars.ENABLE_AI_IMPROVER == 'true'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4.1-mini
