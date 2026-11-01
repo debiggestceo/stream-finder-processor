@@ -650,7 +650,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Runs every minute via the existing Cloudflare Cron Trigger.
+    // Runs every five minutes via the Cloudflare Cron Trigger.
     // Keep the processor warm, persist its health, and recover stale jobs.
     ctx.waitUntil(Promise.allSettled([
       recoverJobs(env),
