@@ -146,8 +146,9 @@ def download_audio_chunk(job_id, video_url, chunk_index, offset, duration):
             )
 
     options = {
-        # Prefer audio-only. If unavailable, use a low-resolution muxed stream and extract audio.
-        "format": "bestaudio/best[height<=240]/best[height<=360]",
+        # Keep a muxed video+audio source: the visual analyzer needs video frames.
+        # Cap resolution to keep temporary downloads within the worker's disk budget.
+        "format": "best[height<=360]/bestvideo[height<=360]+bestaudio/best[height<=480]",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
