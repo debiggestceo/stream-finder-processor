@@ -26,7 +26,7 @@ VISION_FRAME_INTERVAL = 120
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 
-CHUNK_SECONDS = 600
+CHUNK_SECONDS = 1200  # 20-minute chunks reduce per-chunk startup/download overhead
 
 active_chunks = set()
 cancelled_jobs = set()
