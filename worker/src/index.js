@@ -52,6 +52,30 @@ async function dispatchChunk(env, job) {
 }
 
 async function startJob(env, chatId, url) {
+  // Не запускаем одну и ту же запись дважды одновременно для одного чата.
+  // Это защищает от случайной повторной отправки ссылки и двойного расхода ресурсов.
+  const existing = await env.DB.prepare(`
+    SELECT s.job_id, j.next_chunk
+    FROM streams s
+    JOIN stream_job_state j ON j.job_id = s.job_id
+    WHERE s.chat_id = ?
+      AND s.url = ?
+      AND s.status = 'processing'
+      AND j.status IN ('processing', 'running')
+    ORDER BY s.id DESC
+    LIMIT 1
+  `).bind(String(chatId), url).first();
+
+  if (existing) {
+    const minute = Number(existing.next_chunk || 0) * 10;
+    await telegram(
+      env,
+      chatId,
+      `Эта запись уже обрабатывается. Повторно запускать её не буду, чтобы не тратить ресурсы. Сейчас обработано примерно до ${minute}-й минуты.`
+    );
+    return { status: "already_processing", job_id: existing.job_id };
+  }
+
   const jobId = crypto.randomUUID();
   const platform = detectPlatform(url);
 
