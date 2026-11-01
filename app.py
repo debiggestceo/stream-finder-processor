@@ -23,7 +23,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 VISION_SHARED_SECRET = os.getenv("PROCESSOR_SECRET")
 VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
 VISION_MODEL = os.getenv("VISION_MODEL", "@cf/qwen/qwen3.8-27b")
-VISION_FRAME_INTERVAL = 30
+VISION_FRAME_INTERVAL = 120
 PROCESSOR_SECRET = os.getenv("PROCESSOR_SECRET")
 WORKER_URL = "https://stream-finder-bot.stfualmceo.workers.dev"
 
@@ -360,8 +360,11 @@ def analyze_video_frames(source_path, offset, duration):
             )
 
             if response.status_code in (429, 503):
-                log.warning("Cloudflare Workers AI temporarily limited; skipping frame at %s (%s)", format_time(offset + local_time), response.status_code)
-                continue
+                log.warning("Cloudflare Workers AI temporarily limited; stopping visual scan for this chunk at %s (%s)", format_time(offset + local_time), response.status_code)
+                break
+            if not response.ok and ("4006" in response.text or "daily free allocation" in response.text.lower()):
+                log.error("Cloudflare Workers AI daily free neuron quota exhausted; stopping visual scan for this chunk at %s. No paid fallback will be used.", format_time(offset + local_time))
+                break
             if not response.ok:
                 log.error("Vision endpoint failed at %s: HTTP %s %s", format_time(offset + local_time), response.status_code, response.text[:400])
                 response.raise_for_status()
