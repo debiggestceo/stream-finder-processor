@@ -82,7 +82,7 @@ async function startJob(env, chatId, url) {
   `).bind(String(chatId)).first();
 
   if (active) {
-    const minute = Number(active.next_chunk || 0) * 20;
+    const minute = Number(active.next_chunk || 0) * 10;
     await telegram(env, chatId, `У тебя уже обрабатывается одна запись. Сейчас примерно до ${minute}-й минуты. Дождись завершения или отправь /cancel, чтобы отменить её.`);
     return { status: "already_processing", job_id: active.job_id };
   }
@@ -443,7 +443,7 @@ async function showStatus(env, chatId) {
   }
 
   if (job.status === "processing" || job.status === "running") {
-    const minute = Number(job.next_chunk || 0) * 20;
+    const minute = Number(job.next_chunk || 0) * 10;
     return telegram(env, chatId, `⏳ Идёт обработка. Сейчас обработано примерно до ${minute}-й минуты. Второе видео пока отправлять не нужно.`, true);
   }
 
