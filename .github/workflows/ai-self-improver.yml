@@ -12,12 +12,13 @@ permissions:
 
 concurrency:
   group: stream-finder-ai-self-improver
-  cancel-in-progress: false
+  # Never queue overlapping 15-minute runs; the newest check replaces an older one.
+  cancel-in-progress: true
 
 jobs:
   propose-improvement:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Check out main
         uses: actions/checkout@v4
