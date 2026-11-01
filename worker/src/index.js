@@ -413,10 +413,10 @@ async function handleQuestion(env, chatId, question) {
     const answer = result.choices?.[0]?.message?.content || "Не удалось сформировать ответ.";
     const links = moments.slice(0, 5).map(segment => {
       const seconds = timeToSeconds(segment.start_time);
-      const quote = String(segment.transcript || "").replace(/\\s+/g, " ").trim().slice(0, 120);
-      return `• [${segment.start_time}] ${quote}\\n${timestampLink(stream.url, seconds)}`;
+      const quote = String(segment.transcript || "").replace(/\s+/g, " ").trim().slice(0, 120);
+      return `• [${segment.start_time}] ${quote}\n${timestampLink(stream.url, seconds)}`;
     });
-    const momentBlock = links.length ? "\\n\\n🎯 Найденные моменты (по распознанной речи):\\n" + links.join("\\n") : "";
+    const momentBlock = links.length ? "\n\n🎯 Найденные моменты (по распознанной речи):\n" + links.join("\n") : "";
     return telegram(env, chatId, answer + momentBlock);
   } catch (error) {
     console.error("Groq answer error:", error);
