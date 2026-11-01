@@ -359,25 +359,31 @@ VISION_PROMPT = (
 )
 
 
-def analyze_frame_groq(image_base64):
-    """Analyze one frame with Groq's free-plan vision model using the existing Groq key."""
+def analyze_frames_groq(frames):
+    """Analyze up to three timestamped frames in one request to reduce request-count pressure."""
     if not GROQ_API_KEY:
         return None, "not_configured"
     model = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
     endpoint = "https://api.groq.com/openai/v1/chat/completions"
+    content = [{
+        "type": "text",
+        "text": (
+            "Определи содержимое каждого кадра отдельно. Верни строго по одной строке "
+            "на каждый кадр в формате N: короткая метка на русском или NONE. "
+            "Не объединяй кадры и не додумывай.\\n" +
+            "\\n".join(f"КАДР {i + 1}, таймкод {format_time(item['time'])}" for i, item in enumerate(frames))
+        )
+    }]
+    for item in frames:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64," + item["image"]}
+        })
     payload = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": VISION_PROMPT},
-                {"type": "image_url", "image_url": {
-                    "url": "data:image/jpeg;base64," + image_base64
-                }}
-            ]
-        }],
+        "messages": [{"role": "user", "content": content}],
         "temperature": 0.1,
-        "max_completion_tokens": 160
+        "max_completion_tokens": 240
     }
     try:
         response = requests.post(
@@ -385,10 +391,10 @@ def analyze_frame_groq(image_base64):
             headers={"Authorization": f"Bearer {GROQ_API_KEY}",
                      "Content-Type": "application/json"},
             json=payload,
-            timeout=90
+            timeout=120
         )
         if response.status_code == 429:
-            log.warning("Groq vision free quota/rate limit reached; stopping scan. No paid fallback.")
+            log.warning("Groq vision free quota/rate limit reached; switching provider.")
             return None, "quota"
         if response.status_code in (401, 403):
             log.error("Groq vision authorization/access error (HTTP %s)", response.status_code)
@@ -398,7 +404,16 @@ def analyze_frame_groq(image_base64):
         answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         if isinstance(answer, list):
             answer = " ".join(p.get("text", "") for p in answer if isinstance(p, dict))
-        return (answer.strip() if isinstance(answer, str) else "") or "NONE", "ok"
+        if not isinstance(answer, str):
+            return None, "error"
+        parsed = {}
+        for line in answer.splitlines():
+            match = re.match(r"^\s*(\d+)\s*[:.)-]\s*(.*?)\s*$", line)
+            if match:
+                parsed[int(match.group(1)) - 1] = match.group(2).strip()
+        if not parsed and len(frames) == 1:
+            parsed[0] = answer.strip()
+        return [parsed.get(i, "NONE") for i in range(len(frames))], "ok"
     except requests.RequestException as error:
         log.warning("Groq vision request failed: %s", str(error)[:300])
         return None, "error"
@@ -408,7 +423,7 @@ def analyze_frame_groq(image_base64):
 
 
 def analyze_video_frames(source_path, offset, duration):
-    """Use Groq vision first, with Cloudflare as a free fallback only for transient errors."""
+    """Sample every two minutes; batch three frames per vision request where supported."""
     if not VISION_ENABLED:
         log.error("Vision analysis disabled by VISION_ENABLED=false")
         return []
@@ -420,10 +435,13 @@ def analyze_video_frames(source_path, offset, duration):
     results = []
     attempted = extracted = empty = 0
     provider = "Groq" if GROQ_API_KEY else "Cloudflare"
-    groq_vision_disabled_for_chunk = False
-    log.info("Vision started: provider=%s offset=%s frames=%s interval=%ss",
-             provider, format_time(offset), len(positions), VISION_FRAME_INTERVAL)
+    groq_disabled = False
+    batch_size = 3
+    log.info("Vision started: provider=%s offset=%s frames=%s interval=%ss batch_size=%s",
+             provider, format_time(offset), len(positions), VISION_FRAME_INTERVAL, batch_size)
 
+    import base64
+    prepared = []
     for local_time in positions:
         attempted += 1
         frame = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -432,62 +450,71 @@ def analyze_video_frames(source_path, offset, duration):
         try:
             command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                        "-ss", str(local_time), "-i", source_path,
-                       "-frames:v", "1", "-vf", "scale=768:-2", "-q:v", "4", frame_path]
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-            if result.returncode != 0 or not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
+                       "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "5", frame_path]
+            extraction = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+            if extraction.returncode != 0 or not os.path.exists(frame_path) or os.path.getsize(frame_path) < 1000:
                 log.warning("Frame extraction failed at %s", format_time(offset + local_time))
                 continue
-            extracted += 1
-            import base64
             with open(frame_path, "rb") as image_file:
                 encoded = base64.b64encode(image_file.read()).decode("ascii")
-
-            description, groq_status = (None, "not_configured")
-            if GROQ_API_KEY and not groq_vision_disabled_for_chunk:
-                description, groq_status = analyze_frame_groq(encoded)
-                if groq_status == "quota":
-                    log.warning("Groq vision quota exhausted; switching remaining frames to Cloudflare")
-                    groq_vision_disabled_for_chunk = True
-            elif groq_vision_disabled_for_chunk:
-                groq_status = "quota"
-
-            # Cloudflare fallback is also attempted when Groq quota is exhausted.
-            if description is None and groq_status != "configuration":
-                response = requests.post(
-                    WORKER_URL + "/vision",
-                    headers={"Content-Type": "application/json",
-                             "x-stream-finder-secret": VISION_SHARED_SECRET},
-                    json={"image": encoded}, timeout=120)
-                if response.status_code in (429, 503):
-                    log.warning("Cloudflare vision limited (HTTP %s); stopping scan", response.status_code)
-                    break
-                if not response.ok and ("4006" in response.text or "daily free allocation" in response.text.lower()):
-                    log.error("Cloudflare daily free quota exhausted. No paid fallback.")
-                    break
-                response.raise_for_status()
-                payload = response.json()
-                description = payload.get("result") if isinstance(payload, dict) else None
-
-            if not isinstance(description, str):
-                continue
-            description = " ".join(description.strip().split())
-            if not description or description.upper() in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
-                empty += 1
-                continue
-
-            absolute_time = offset + local_time
-            log.info("Vision recognized at %s: %s", format_time(absolute_time), description[:140])
-            results.append({"start": absolute_time, "end": absolute_time,
-                            "time": format_time(absolute_time),
-                            "text": "[ВИДЕО-МЕТКА] " + description[:180]})
+            prepared.append({"time": local_time, "image": encoded})
+            extracted += 1
         except Exception:
-            log.exception("Vision analysis failed at %s", format_time(offset + local_time))
+            log.exception("Frame extraction failed at %s", format_time(offset + local_time))
         finally:
             try:
                 if os.path.exists(frame_path):
                     os.remove(frame_path)
             except OSError:
                 pass
+
+    for batch_start in range(0, len(prepared), batch_size):
+        batch = prepared[batch_start:batch_start + batch_size]
+        descriptions = None
+        groq_status = "quota" if groq_disabled else "not_configured"
+        if GROQ_API_KEY and not groq_disabled:
+            descriptions, groq_status = analyze_frames_groq(batch)
+            if groq_status == "quota":
+                groq_disabled = True
+                log.warning("Groq vision quota exhausted; using Cloudflare fallback for remaining frames")
+        if descriptions is None and groq_status != "configuration":
+            descriptions = []
+            for item in batch:
+                try:
+                    response = requests.post(
+                        WORKER_URL + "/vision",
+                        headers={"Content-Type": "application/json",
+                                 "x-stream-finder-secret": VISION_SHARED_SECRET},
+                        json={"image": item["image"]}, timeout=120)
+                    if response.status_code in (429, 503):
+                        log.warning("Cloudflare vision limited (HTTP %s); remaining frames deferred", response.status_code)
+                        descriptions = None
+                        break
+                    if not response.ok and ("4006" in response.text or "daily free allocation" in response.text.lower()):
+                        log.error("Cloudflare daily free quota exhausted. No paid fallback; remaining frames not analyzed.")
+                        descriptions = None
+                        break
+                    response.raise_for_status()
+                    payload = response.json()
+                    descriptions.append(payload.get("result") if isinstance(payload, dict) else "NONE")
+                except Exception as error:
+                    log.warning("Cloudflare frame analysis failed at %s: %s",
+                                format_time(offset + item["time"]), str(error)[:200])
+                    descriptions.append("NONE")
+        if descriptions is None:
+            continue
+        for item, description in zip(batch, descriptions):
+            if not isinstance(description, str):
+                continue
+            description = " ".join(description.strip().split())
+            if not description or description.upper() in ("NONE", "НЕТ", "НЕ ОПРЕДЕЛЕНО"):
+                empty += 1
+                continue
+            absolute_time = offset + item["time"]
+            log.info("Vision recognized at %s: %s", format_time(absolute_time), description[:140])
+            results.append({"start": absolute_time, "end": absolute_time,
+                            "time": format_time(absolute_time),
+                            "text": "[ВИДЕО-МЕТКА] " + description[:180]})
 
     log.info("Vision finished: provider=%s model=%s offset=%s attempted=%s extracted=%s empty=%s recognized=%s",
              provider, os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b"),
