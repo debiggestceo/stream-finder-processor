@@ -426,17 +426,17 @@ async function handleQuestion(env, chatId, question) {
 }
 
 async function findClipMoments(env, chatId) {
-  const stream = await env.DB.prepare(\`
+  const stream = await env.DB.prepare(`
     SELECT job_id, status, url FROM streams WHERE chat_id = ? ORDER BY id DESC LIMIT 1
-  \`).bind(String(chatId)).first();
+  `).bind(String(chatId)).first();
 
   if (!stream) return telegram(env, chatId, "Сначала отправь ссылку на запись Kick, Twitch или YouTube.");
   if (stream.status !== "completed") return telegram(env, chatId, "Сначала дождись окончания обработки записи.");
 
-  const rows = await env.DB.prepare(\`
+  const rows = await env.DB.prepare(`
     SELECT start_time, end_time, transcript FROM stream_segments
     WHERE job_id = ? ORDER BY segment_index
-  \`).bind(stream.job_id).all();
+  `).bind(stream.job_id).all();
 
   const segments = (rows.results || []).filter(s => String(s.transcript || "").trim());
   if (!segments.length) return telegram(env, chatId, "В этой записи нет расшифровки для поиска моментов.");
@@ -462,7 +462,7 @@ async function findClipMoments(env, chatId) {
 
   let transcript = [...selectedIndexes].sort((a, b) => a - b).map(i => {
     const s = segments[i];
-    return \`[\${s.start_time}] \${String(s.transcript || "").trim()}\`;
+    return `[${s.start_time}] ${String(s.transcript || "").trim()}`;
   }).join("\n");
 
   if (transcript.length > 22000) transcript = transcript.slice(0, 22000);
@@ -473,7 +473,7 @@ async function findClipMoments(env, chatId) {
   try {
     const response = await fetch(GROQ_CHAT_URL, {
       method: "POST",
-      headers: { "Authorization": \`Bearer \${env.GROQ_API_KEY}\`, "Content-Type": "application/json" },
+      headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: GROQ_CHAT_MODEL,
         temperature: 0,
@@ -492,7 +492,7 @@ async function findClipMoments(env, chatId) {
 
     if (!response.ok) {
       const detail = await response.text();
-      throw new Error(\`Groq HTTP \${response.status}: \${detail.slice(0, 300)}\`);
+      throw new Error(`Groq HTTP ${response.status}: ${detail.slice(0, 300)}`);
     }
 
     const payload = await response.json();
@@ -526,7 +526,7 @@ async function findClipMoments(env, chatId) {
 
     const lines = top.map((item, i) => {
       const link = timestampLink(stream.url, item.seconds);
-      return \`\${i + 1}. \${item.time} · \${item.score}/10\n\${item.reason}\n\${link}\`;
+      return `${i + 1}. ${item.time} · ${item.score}/10\n${item.reason}\n${link}`;
     });
     return telegram(env, chatId,
       "🎬 Лучшие кандидаты для клипов (по расшифровке):\n\n" +
