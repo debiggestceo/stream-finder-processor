@@ -5,6 +5,7 @@ const GROQ_CHAT_MODEL = "openai/gpt-oss-120b";
 const MAIN_KEYBOARD = {
   keyboard: [
     [{ text: "📊 Статус" }, { text: "❌ Отменить" }],
+    [{ text: "🎬 Найти клипы" }],
     [{ text: "❓ Как пользоваться" }]
   ],
   resize_keyboard: true,
@@ -424,6 +425,120 @@ async function handleQuestion(env, chatId, question) {
   }
 }
 
+async function findClipMoments(env, chatId) {
+  const stream = await env.DB.prepare(\`
+    SELECT job_id, status, url FROM streams WHERE chat_id = ? ORDER BY id DESC LIMIT 1
+  \`).bind(String(chatId)).first();
+
+  if (!stream) return telegram(env, chatId, "Сначала отправь ссылку на запись Kick, Twitch или YouTube.");
+  if (stream.status !== "completed") return telegram(env, chatId, "Сначала дождись окончания обработки записи.");
+
+  const rows = await env.DB.prepare(\`
+    SELECT start_time, end_time, transcript FROM stream_segments
+    WHERE job_id = ? ORDER BY segment_index
+  \`).bind(stream.job_id).all();
+
+  const segments = (rows.results || []).filter(s => String(s.transcript || "").trim());
+  if (!segments.length) return telegram(env, chatId, "В этой записи нет расшифровки для поиска моментов.");
+  if (!env.GROQ_API_KEY) return telegram(env, chatId, "Поиск клипов сейчас недоступен: не настроен Groq API.");
+
+  const ranked = segments.map((s, index) => {
+    const text = String(s.transcript || "");
+    let score = 0;
+    if (text.includes("?")) score += 4;
+    if (text.includes("!")) score += 2;
+    if (/\b(haha|hahaha|lol|lmao|laugh|laughing|no way|oh my god|what the hell|bro|crazy|wild|seriously)\b/i.test(text)) score += 4;
+    if (/\b(what|why|how|who|when|would you|have you|did you|are you|do you)\b/i.test(text)) score += 1;
+    if (text.length >= 55 && text.length <= 320) score += 1;
+    return { index, score };
+  }).filter(x => x.score > 0).sort((a, b) => b.score - a.score).slice(0, 55);
+
+  const selectedIndexes = new Set();
+  for (const hit of ranked) {
+    for (let i = Math.max(0, hit.index - 2); i <= Math.min(segments.length - 1, hit.index + 2); i++) {
+      selectedIndexes.add(i);
+    }
+  }
+
+  let transcript = [...selectedIndexes].sort((a, b) => a - b).map(i => {
+    const s = segments[i];
+    return \`[\${s.start_time}] \${String(s.transcript || "").trim()}\`;
+  }).join("\n");
+
+  if (transcript.length > 22000) transcript = transcript.slice(0, 22000);
+  if (!transcript.trim()) return telegram(env, chatId, "Не нашёл подходящих фрагментов в расшифровке.");
+
+  await telegram(env, chatId, "🔎 Ищу лучшие моменты по всей расшифровке. Это может занять немного времени…");
+
+  try {
+    const response = await fetch(GROQ_CHAT_URL, {
+      method: "POST",
+      headers: { "Authorization": \`Bearer \${env.GROQ_API_KEY}\`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: GROQ_CHAT_MODEL,
+        temperature: 0,
+        messages: [
+          {
+            role: "system",
+            content: "Ты редактор коротких вирусных клипов из англоязычного IRL-стрима. Ищи карточную игру, смешные или неожиданные ответы, вопросы, флирт, подколы, неловкие моменты, шутки и яркие реакции. Анализируй только переданную расшифровку Whisper: она может ошибаться, поэтому не выдумывай события и не называй смех/эмоцию, если этого нельзя понять из текста. Выбери до 8 самых перспективных моментов для TikTok/Reels/Shorts. Для каждого верни время ОДНОЙ из строк в квадратных скобках без изменений, короткую причину на русском и оценку 1–10. Верни только валидный JSON-массив вида [{\"time\":\"00:12:34\",\"reason\":\"...\",\"score\":9}]. Не добавляй Markdown и никакого текста вне JSON. Если хороших моментов нет — верни []."
+          },
+          {
+            role: "user",
+            content: "Найди самые сильные моменты для клипов из этой записи. Вот фрагменты расшифровки с таймкодами:\n\n" + transcript
+          }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(\`Groq HTTP \${response.status}: \${detail.slice(0, 300)}\`);
+    }
+
+    const payload = await response.json();
+    const raw = payload.choices?.[0]?.message?.content || "";
+    const match = String(raw).match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("AI вернул ответ не в формате JSON");
+    const picks = JSON.parse(match[0]);
+
+    const validTimes = new Set(segments.map(s => String(s.start_time)));
+    const unique = [];
+    const seenSeconds = [];
+    for (const pick of Array.isArray(picks) ? picks : []) {
+      const time = String(pick.time || "");
+      if (!validTimes.has(time)) continue;
+      const seconds = timeToSeconds(time);
+      if (seenSeconds.some(existing => Math.abs(existing - seconds) < 35)) continue;
+      seenSeconds.push(seconds);
+      unique.push({
+        time,
+        seconds,
+        reason: String(pick.reason || "Интересный фрагмент").slice(0, 180),
+        score: Math.max(1, Math.min(10, Number(pick.score) || 5))
+      });
+    }
+
+    unique.sort((a, b) => b.score - a.score);
+    const top = unique.slice(0, 8);
+    if (!top.length) {
+      return telegram(env, chatId, "Не удалось уверенно выделить подходящие моменты по расшифровке. Можно попробовать поиск по конкретному слову или теме.");
+    }
+
+    const lines = top.map((item, i) => {
+      const link = timestampLink(stream.url, item.seconds);
+      return \`\${i + 1}. \${item.time} · \${item.score}/10\n\${item.reason}\n\${link}\`;
+    });
+    return telegram(env, chatId,
+      "🎬 Лучшие кандидаты для клипов (по расшифровке):\n\n" +
+      lines.join("\n\n") +
+      "\n\nОткрой таймкод, проверь сам момент и вырежи примерно 20–45 секунд. Бот пока находит моменты, но не экспортирует готовые видео."
+    );
+  } catch (error) {
+    console.error("Clip moment analysis failed:", error);
+    return telegram(env, chatId, "Не удалось найти клипы: " + String(error?.message || error).slice(0, 350));
+  }
+}
+
 async function showStatus(env, chatId) {
   const job = await env.DB.prepare(`
     SELECT job_id, next_chunk, status, updated_at
@@ -515,10 +630,11 @@ async function handleTelegram(update, env) {
 
   if (text === "/cancel" || text === "❌ Отменить") return cancelJob(env, chatId);
   if (text === "📊 Статус") return showStatus(env, chatId);
+  if (text === "🎬 Найти клипы" || text === "/clips") return findClipMoments(env, chatId);
 
   if (text === "❓ Как пользоваться") {
     return telegram(env, chatId,
-      "1. Отправь ссылку на запись Kick, Twitch или YouTube.\n2. Дождись обработки.\n3. Задавай любые вопросы по содержанию.\n\nНапример: «Он слушал Понасенкова?» или «О чём говорили в начале?»",
+      "1. Отправь ссылку на запись Kick, Twitch или YouTube.\n2. Дождись обработки.\n3. Нажми «🎬 Найти клипы», чтобы получить лучшие таймкоды.\n4. Или задавай любые вопросы по содержанию.\n\nПоиск клипов оценивает расшифровку и не создаёт готовые видео.\n\nНапример: «Он слушал Понасенкова?» или «О чём говорили в начале?»",
       true
     );
   }
